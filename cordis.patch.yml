@@ -1,0 +1,9 @@
+# dsh-trusted-proxy-auth — bundle patch layer.
+#
+# Inserted after every shipped bundle layer, so `@deepseek-ai/dsh-client-connection`
+# is already mounted and this row activates once its `connection` injection
+# resolves. The plugin decorates the live connection instance only; it does not
+# replace the Connection package or touch any DSH installation file.
+- insert:
+    - id: trusted-proxy-auth
+      name: dsh-trusted-proxy-auth

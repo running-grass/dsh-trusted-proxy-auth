@@ -1,0 +1,10 @@
+# Node
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+*.tgz
+
+# Local integration-test scratch space
+.test-tmp/
+coverage/

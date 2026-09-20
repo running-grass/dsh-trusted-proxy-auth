@@ -1,0 +1,51 @@
+{
+  "name": "dsh-trusted-proxy-auth",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness plugin that trusts authentication already performed by a reverse proxy (Traefik + Keycloak OIDC) while keeping native DSH browser authentication as a fallback.",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "test:integration": "node test/integration/run.mjs"
+  },
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "traefik",
+    "keycloak",
+    "oidc",
+    "reverse-proxy",
+    "authentication"
+  ],
+  "license": "MIT",
+  "author": "Luke Hann",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lukepoo101/dsh-trusted-proxy-auth.git"
+  },
+  "homepage": "https://github.com/lukepoo101/dsh-trusted-proxy-auth#readme",
+  "bugs": {
+    "url": "https://github.com/lukepoo101/dsh-trusted-proxy-auth/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

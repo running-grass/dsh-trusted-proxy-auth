@@ -1,0 +1,42 @@
+# Illustrative Traefik dynamic configuration for protecting a DSH Web service
+# with Keycloak OIDC and the dsh-trusted-proxy-auth handoff header.
+#
+# This file is documentation, not a tested deployment artifact. Replace the
+# placeholder secret, hostnames, URLs, and certificate resolver with your own.
+#
+# Key requirements (see README "Reverse-proxy contract"):
+#   1. Successful OIDC authentication before reaching DSH.
+#   2. Overwrite any inbound X-DSH-Proxy-Auth value (customRequestHeaders does
+#      this by setting the header on every forwarded request).
+#   3. Forward the header on HTTP and WebSocket upgrades.
+#   4. Preserve the public Host so it matches DSH's --trusted-host entry.
+
+http:
+  middlewares:
+    dsh-oidc:
+      forwardAuth:
+        address: 'http://keycloak:8080/realms/example/protocol/openid-connect/auth'
+        # In practice use an oauth2-proxy / forward-auth service that performs
+        # the OIDC flow; the placeholder above only marks the stage.
+
+    # The handoff: DSH sees this header only after OIDC succeeded above.
+    dsh-proxy-auth:
+      headers:
+        customRequestHeaders:
+          X-DSH-Proxy-Auth: 'REPLACE_WITH_OPENSSL_RAND_HEX_48'
+
+  routers:
+    dsh:
+      rule: 'Host(`dsh.example.com`)'
+      entryPoints: [websecure]
+      middlewares: [dsh-oidc, dsh-proxy-auth]
+      service: dsh
+      tls:
+        certResolver: le
+
+  services:
+    dsh:
+      loadBalancer:
+        servers:
+          # Firewall this port so only the Traefik network can reach it.
+          - url: 'http://10.0.20.103:3081'

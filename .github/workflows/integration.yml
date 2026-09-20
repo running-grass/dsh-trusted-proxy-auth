@@ -1,0 +1,26 @@
+name: integration
+
+# Boots a real DeepSeek Harness Web server with the plugin installed in a
+# throwaway DSH_HOME. Run manually or on a weekly schedule; it depends on the
+# published @deepseek-ai/dsh package and on pnpm being installable.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  real-dsh:
+    name: real DSH integration (node 24)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install dsh and pnpm
+        run: npm install --global @deepseek-ai/dsh pnpm
+      - name: Run integration tests
+        run: npm run test:integration
