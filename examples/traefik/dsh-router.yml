@@ -38,5 +38,10 @@ http:
     dsh:
       loadBalancer:
         servers:
-          # Firewall this port so only the Traefik network can reach it.
+          # SECURITY: this hop carries X-DSH-Proxy-Auth in clear text over
+          # plain HTTP. Firewall the port so only the Traefik network can
+          # reach it, and additionally keep the path on an isolated trusted
+          # segment or encrypted overlay (WireGuard, VXLAN+IPsec) — or switch
+          # this URL to https with TLS/mTLS. Firewalling alone does not stop
+          # passive sniffing and replay of the bearer secret.
           - url: 'http://10.0.20.103:3081'

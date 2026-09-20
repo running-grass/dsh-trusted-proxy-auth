@@ -54,8 +54,21 @@ const LOG_PREFIX = 'trusted-proxy-auth'
  * Hidden back-reference installed on every wrapper, so a later activation can
  * unwrap a wrapper it finds instead of stacking on top of it, and so cleanup
  * can tell "our wrapper is still installed" from "someone else changed it".
+ *
+ * Registered with `Symbol.for` so two generations of this module loaded at the
+ * same time (for example around a live reload) share the marker and unwrap each
+ * other instead of stacking.
  */
-const INNER = Symbol('trusted-proxy-auth.inner')
+const INNER = Symbol.for('dsh-trusted-proxy-auth.inner.v1')
+
+/**
+ * Accepted secret shape: printable ASCII other than comma.
+ *
+ * Excluding comma and whitespace makes the duplicate/joined-header guarantee
+ * unambiguous, because HTTP header folding joins duplicates with `", "`, which
+ * can then never equal the secret.
+ */
+const SECRET_PATTERN = /^[\x21-\x2b\x2d-\x7e]+$/
 
 /**
  * Read the expected secret from the environment and enforce its minimum size.
@@ -73,6 +86,11 @@ function readExpectedSecret() {
     throw new Error(
       `${LOG_PREFIX}: ${SECRET_ENV} must be at least ${MIN_SECRET_BYTES} bytes; `
         + 'generate one with `openssl rand -hex 48`',
+    )
+  }
+  if (!SECRET_PATTERN.test(value)) {
+    throw new Error(
+      `${LOG_PREFIX}: ${SECRET_ENV} must contain only printable ASCII characters other than comma`,
     )
   }
   return value
@@ -172,6 +190,10 @@ function captureMethod(connection, property) {
  * Install one wrapper as an own property of the connection instance and
  * return a cleanup function.
  *
+ * Installation is transactional: if the assignment takes effect but
+ * verification fails, the mutation is undone before this function throws, so
+ * no caller is ever left holding a half-installed wrapper.
+ *
  * Cleanup is compare-and-swap: it restores only when this exact wrapper is
  * still installed, and it deletes the instance override when the method was
  * originally inherited from the prototype, so the object's shape returns to
@@ -188,25 +210,39 @@ function installWrapper(connection, captured, wrapper) {
     value: { original: captured.original, originalWasOwn: captured.originalWasOwn },
     enumerable: false,
   })
-  try {
-    connection[captured.property] = wrapper
-  } catch {
-    throw new Error(
-      `${LOG_PREFIX}: unsupported DSH connection interface: ${captured.property} could not be decorated`,
-    )
-  }
-  const installed = readMethod(connection, captured.property)
-  if (installed === undefined || installed.value !== wrapper) {
-    throw new Error(
-      `${LOG_PREFIX}: unsupported DSH connection interface: ${captured.property} could not be decorated`,
-    )
-  }
-  return () => {
+  const restore = () => {
     const current = readMethod(connection, captured.property)
     if (current === undefined || current.value !== wrapper) return
     if (captured.originalWasOwn) connection[captured.property] = captured.original
     else delete connection[captured.property]
   }
+  const rollback = () => {
+    if (captured.originalWasOwn) connection[captured.property] = captured.original
+    else delete connection[captured.property]
+  }
+  const unsupported = () => new Error(
+    `${LOG_PREFIX}: unsupported DSH connection interface: ${captured.property} could not be decorated`,
+  )
+  try {
+    try {
+      connection[captured.property] = wrapper
+    } catch {
+      throw unsupported()
+    }
+    const installed = readMethod(connection, captured.property)
+    if (installed === undefined || installed.value !== wrapper) throw unsupported()
+  } catch (error) {
+    // Verification can fail after the write landed (for example if a future
+    // proxy reports the value differently). Undo it here, because this
+    // function cannot hand its restore callback back to the caller.
+    try {
+      rollback()
+    } catch {
+      // Best effort; activation still fails loudly below.
+    }
+    throw error
+  }
+  return restore
 }
 
 /**
@@ -230,6 +266,58 @@ function writeForbidden(response) {
  */
 function info(ctx, message) {
   ctx?.logger?.info?.(`${LOG_PREFIX}: ${message}`)
+}
+
+/**
+ * Verify the Cordis context can register the cleanup disposer. Checked before
+ * anything is decorated, so a context without `ctx.effect` never leaves the
+ * connection half-wrapped.
+ *
+ * @param ctx - owning Cordis context.
+ * @throws when `ctx.effect` is unavailable.
+ */
+function assertContext(ctx) {
+  if (ctx === null || typeof ctx !== 'object' || typeof ctx.effect !== 'function') {
+    throw new Error(`${LOG_PREFIX}: unsupported DSH context: ctx.effect is not available`)
+  }
+}
+
+/**
+ * Prove the `requestRejection` semantic contract this plugin's security model
+ * depends on, using the original, undecorated method:
+ *
+ * - an unauthenticated loopback request is `401` (native browser auth failed);
+ * - an untrusted Host is `403` (the Host/DNS-rebinding fence refused it);
+ * - a cross-origin request is `403`;
+ * - a cross-site request is `403`.
+ *
+ * A future DSH that keeps the methods but reorders or remaps these statuses
+ * must fail activation, because promoting a `401` is only safe while `401`
+ * exclusively means "native browser session missing". The probe requests carry
+ * no credentials and have no side effects.
+ *
+ * @param connection - the `ctx.connection` service.
+ * @param rejection - captured original `requestRejection`.
+ * @throws when the observed statuses do not match the contract.
+ */
+function assertSemantics(connection, rejection) {
+  const probe = (headers) => rejection.original.call(connection, { headers })
+  const loopbackUnauthenticated = probe({ host: '127.0.0.1' })
+  const untrustedHost = probe({ host: `dsh-proxy-probe-${process.pid}.invalid` })
+  const crossOrigin = probe({ host: '127.0.0.1', origin: 'https://dsh-proxy-probe.invalid' })
+  const crossSite = probe({ host: '127.0.0.1', 'sec-fetch-site': 'cross-site' })
+  if (
+    loopbackUnauthenticated !== 401
+    || untrustedHost !== 403
+    || crossOrigin !== 403
+    || crossSite !== 403
+  ) {
+    throw new Error(
+      `${LOG_PREFIX}: unsupported DSH requestRejection semantics: `
+        + `loopback=${String(loopbackUnauthenticated)} untrustedHost=${String(untrustedHost)} `
+        + `crossOrigin=${String(crossOrigin)} crossSite=${String(crossSite)}`,
+    )
+  }
 }
 
 /**
@@ -259,11 +347,13 @@ function assertConnection(connection) {
  */
 export function apply(ctx) {
   const expectedSecret = readExpectedSecret()
-  const connection = ctx?.connection
+  assertContext(ctx)
+  const connection = ctx.connection
   assertConnection(connection)
 
   const rejection = captureMethod(connection, 'requestRejection')
   const index = captureMethod(connection, 'authorizeIndex')
+  assertSemantics(connection, rejection)
 
   const hasValidSecret = (request) => secretMatches(headerValue(request?.headers, HEADER_NAME), expectedSecret)
 
@@ -284,14 +374,22 @@ export function apply(ctx) {
       writeForbidden(response)
       return false
     }))
+
+    ctx.effect(() => () => {
+      for (const restore of [...restores].reverse()) restore()
+    }, `${LOG_PREFIX}: connection decoration`)
   } catch (error) {
-    for (const restore of restores.reverse()) restore()
+    // Roll back everything installed in this activation, including the case
+    // where ctx.effect failed to register the disposer.
+    for (const restore of [...restores].reverse()) {
+      try {
+        restore()
+      } catch {
+        // Best effort; the activation still fails loudly below.
+      }
+    }
     throw error
   }
-
-  ctx.effect(() => () => {
-    for (const restore of [...restores].reverse()) restore()
-  }, `${LOG_PREFIX}: connection decoration`)
 
   info(ctx, 'activated')
 }

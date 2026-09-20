@@ -14,22 +14,26 @@ They are recorded here as evidence; re-run the commands to reproduce.
 | DSH install files modified | none (`find … -newermt` returned no files) |
 | Production profile touched | no (the running server and its profile were left untouched) |
 
-## Unit tests — 39 passed, 0 failed
+## Unit tests — 50 passed, 0 failed
 
 ```console
 $ npm test
-ℹ tests 39
-ℹ suites 5
-ℹ pass 39
+ℹ tests 50
+ℹ suites 6
+ℹ pass 50
 ℹ fail 0
 ```
 
-Coverage: `requestRejection` result mapping; `authorizeIndex` decision tree;
-header parsing (exact, off-by-one, empty, missing, array, duplicate, joined,
-`Headers` case-insensitivity); configuration failures (missing/empty/short
-secret, missing service, missing methods, non-extensible service, undecoratable
-method with rollback); lifecycle (install, exact-shape restore for inherited and
-own methods, apply→cleanup→apply, overlapping activations, `authenticatedUrl`
+Coverage: `requestRejection` result mapping (including pass-through of an
+unexpected upstream status); `authorizeIndex` decision tree; header parsing
+(exact, off-by-one, empty, missing, absent headers, array, non-string,
+duplicate, joined, `Headers` case-insensitivity); configuration failures
+(missing/empty/short/comma/whitespace/non-ASCII secret, missing `ctx.effect`,
+missing service, missing methods, non-extensible service, undecoratable method
+with rollback, a mutation that landed but failed verification, and rollback when
+`ctx.effect` fails); the startup semantic invariant; lifecycle (install,
+exact-shape restore for inherited and own methods, apply→cleanup→apply,
+overlapping activations, cross-generation global-marker unwrap, `authenticatedUrl`
 untouched, no secret in logs).
 
 ## Integration tests — 35 passed, 0 failed
@@ -92,6 +96,25 @@ loaded next to `@deepseek-ai/dsh-client-connection` and asserts:
 PASS: 35 passed, 0 failed
 ```
 
+## Startup semantic invariant
+
+`requestRejection` shape is checked, but so is its meaning. Before decorating
+anything, activation calls the original, undecorated method with four
+credential-free probe requests and requires:
+
+| Probe | Required result |
+| --- | --- |
+| `host: 127.0.0.1`, no credentials | `401` (native browser auth missing) |
+| `host: dsh-proxy-probe-<pid>.invalid` | `403` (Host/DNS-rebinding fence) |
+| `host: 127.0.0.1`, `origin: https://dsh-proxy-probe.invalid` | `403` |
+| `host: 127.0.0.1`, `sec-fetch-site: cross-site` | `403` |
+
+Anything else fails activation with `unsupported DSH requestRejection
+semantics`, so a DSH upgrade that, for example, authenticates before applying
+the trust fence (making an untrusted Host return `401`) cannot silently turn
+into a bypass. The real-DSH integration run above boots the server with this
+probe active, so the invariant is also proven against `0.1.5-rc.2` end to end.
+
 ## Runtime interface probe (DSH 0.1.5-rc.2)
 
 Probe output against the real `HostConnectionService`:
@@ -127,9 +150,18 @@ prototype method intact                 : true
   inherited, assignment when it was an own property).
 - `authenticatedUrl` is intentionally left untouched, so the native
   `http://127.0.0.1:3080/?token=…` URL keeps working as an emergency/admin path.
+- Hardening applied after external review: the startup semantic probe (above);
+  transactional installation (a write that landed but failed verification is
+  undone before the function throws, and installation and disposer registration
+  share one rollback path); a `Symbol.for` wrapper marker so two module
+  generations unwrap each other; and a secret charset restricted to printable
+  ASCII minus comma/whitespace.
 
 ## Known compatibility issues
 
-None observed on DSH `0.1.5-rc.2`. The plugin validates the interface on every
-activation, so a future DSH that changes these methods fails the profile loudly
-instead of silently removing authentication.
+None observed on DSH `0.1.5-rc.2`. The plugin validates the interface shape and
+the `requestRejection` semantics on every activation, so a future DSH that
+changes either fails the profile loudly instead of silently removing
+authentication. CI runs the real-DSH integration suite on every push/PR against
+the pinned `0.1.5-rc.2`, and on a weekly schedule against
+`@deepseek-ai/dsh@latest` as an early-warning signal.

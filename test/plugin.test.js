@@ -2,9 +2,9 @@
  * Unit tests for dsh-trusted-proxy-auth.
  *
  * These tests exercise the plugin against a fake Cordis context and a fake
- * `connection` service. The real-DSH integration suite lives in
- * `test/integration/run.mjs` and proves the same behaviour against a running
- * Harness HTTP server.
+ * `connection` service that mirrors DSH's current `requestRejection`
+ * semantics. The real-DSH integration suite lives in `test/integration/run.mjs`
+ * and proves the same behaviour against a running Harness HTTP server.
  */
 
 import assert from 'node:assert/strict'
@@ -14,6 +14,15 @@ import { HEADER_NAME, MIN_SECRET_BYTES, SECRET_ENV, apply } from '../index.js'
 
 /** A known-good secret of exactly 48 bytes. */
 const SECRET = 'unit-test-secret-'.padEnd(48, '0')
+
+/** A loopback authority the fake treats as trusted, like DSH does. */
+const LOOPBACK_HOST = '127.0.0.1'
+
+/** Cookie marker that makes a fake request look natively authenticated. */
+const NATIVE_SESSION = 'dsh-fake-session'
+
+/** The registered marker a wrapper from any generation of this module carries. */
+const INNER = Symbol.for('dsh-trusted-proxy-auth.inner.v1')
 
 assert.ok(Buffer.byteLength(SECRET) >= MIN_SECRET_BYTES)
 
@@ -67,17 +76,58 @@ function fakeResponse() {
   }
 }
 
-/** Connection service whose methods live on the prototype, as upstream does. */
+/** Read a header from a Fetch `Headers` instance or a plain object. */
+function readHeader(headers, name) {
+  if (headers instanceof Headers) return headers.get(name) ?? undefined
+  const value = headers?.[name]
+  return typeof value === 'string' ? value : undefined
+}
+
+/**
+ * Connection service whose methods live on the prototype, as upstream does.
+ *
+ * The default `requestRejection` mirrors DSH 0.1.5-rc.2: the Host/Origin fence
+ * returns 403, and missing native browser authentication returns 401. Pass
+ * `semantics` to simulate a future DSH that changed that mapping.
+ */
 class FakeConnection {
   constructor(options = {}) {
-    this.rejectionResult = options.rejectionResult
+    this.semantics = options.semantics
     this.rejectionCalls = 0
     this.indexCalls = 0
   }
 
-  requestRejection() {
+  requestRejection(request) {
     this.rejectionCalls += 1
-    return this.rejectionResult
+    if (typeof this.semantics === 'function') return this.semantics(request)
+    return this.evaluate(request)
+  }
+
+  /** DSH 0.1.5-rc.2 semantics, reusable by custom `semantics` overrides. */
+  evaluate(request) {
+    const headers = request?.headers ?? {}
+    const host = readHeader(headers, 'host')
+    if (host === undefined) return 403
+    let hostUrl
+    try {
+      hostUrl = new URL(`http://${host}`)
+    } catch {
+      return 403
+    }
+    const loopback = hostUrl.hostname === LOOPBACK_HOST
+      || hostUrl.hostname === 'localhost'
+      || hostUrl.hostname === '[::1]'
+    if (!loopback && hostUrl.host !== 'dsh.test.example') return 403
+    if (readHeader(headers, 'sec-fetch-site') === 'cross-site') return 403
+    const origin = readHeader(headers, 'origin')
+    if (origin !== undefined) {
+      try {
+        if (new URL(origin).host !== hostUrl.host) return 403
+      } catch {
+        return 403
+      }
+    }
+    return readHeader(headers, 'cookie') === NATIVE_SESSION ? undefined : 401
   }
 
   authorizeIndex(request, response) {
@@ -92,74 +142,141 @@ class FakeConnection {
   }
 }
 
-/** Activate the plugin against a fake connection and return its context. */
+/**
+ * Activate the plugin against a fake connection, then reset call counters so a
+ * test observes only the requests it issues itself (activation runs the
+ * semantic probe).
+ */
 function activate(connection, secret = SECRET) {
   process.env[SECRET_ENV] = secret
   const ctx = fakeContext(connection)
   apply(ctx)
+  connection.rejectionCalls = 0
+  connection.indexCalls = 0
   return ctx
 }
 
 /** Run one request through the decorated `requestRejection`. */
 function rejectWith(headers, options = {}) {
-  const connection = options.connection ?? new FakeConnection({ rejectionResult: 401 })
+  const connection = options.connection ?? new FakeConnection()
   const ctx = activate(connection, options.secret)
-  const result = connection.requestRejection({ headers })
+  const requestHeaders = headers === undefined
+    ? undefined
+    : headers instanceof Headers
+      ? headers
+      : { host: LOOPBACK_HOST, ...headers }
+  const result = connection.requestRejection({ headers: requestHeaders })
   return { result, connection, ctx }
 }
 
 describe('requestRejection', () => {
   const cases = [
-    { title: 'original 403 with a valid secret stays 403', result: 403, header: SECRET, expected: 403 },
-    { title: 'original 403 with a wrong secret stays 403', result: 403, header: 'z'.repeat(48), expected: 403 },
-    { title: 'original 401 with a valid secret is permitted', result: 401, header: SECRET, expected: undefined },
-    { title: 'original 401 with a missing header stays 401', result: 401, header: undefined, expected: 401 },
-    { title: 'original 401 with a wrong secret stays 401', result: 401, header: 'w'.repeat(48), expected: 401 },
-    { title: 'original undefined with no header stays undefined', result: undefined, header: undefined, expected: undefined },
-    { title: 'original undefined with a valid secret stays undefined', result: undefined, header: SECRET, expected: undefined },
+    {
+      title: 'untrusted Host (403) with a valid secret stays 403',
+      host: 'evil.example',
+      header: SECRET,
+      expected: 403,
+    },
+    {
+      title: 'untrusted Host (403) with a wrong secret stays 403',
+      host: 'evil.example',
+      header: 'z'.repeat(48),
+      expected: 403,
+    },
+    {
+      title: 'native 401 with a valid secret is permitted',
+      host: LOOPBACK_HOST,
+      header: SECRET,
+      expected: undefined,
+    },
+    {
+      title: 'native 401 with a missing header stays 401',
+      host: LOOPBACK_HOST,
+      header: undefined,
+      expected: 401,
+    },
+    {
+      title: 'native 401 with a wrong secret stays 401',
+      host: LOOPBACK_HOST,
+      header: 'w'.repeat(48),
+      expected: 401,
+    },
+    {
+      title: 'already authenticated (undefined) with no header stays undefined',
+      native: true,
+      host: LOOPBACK_HOST,
+      header: undefined,
+      expected: undefined,
+    },
+    {
+      title: 'already authenticated (undefined) with a valid secret stays undefined',
+      native: true,
+      host: LOOPBACK_HOST,
+      header: SECRET,
+      expected: undefined,
+    },
   ]
 
   for (const testCase of cases) {
     it(testCase.title, () => {
-      const connection = new FakeConnection({ rejectionResult: testCase.result })
+      const connection = new FakeConnection()
       const ctx = activate(connection)
-      const headers = testCase.header === undefined ? {} : { [HEADER_NAME]: testCase.header }
+      const headers = { host: testCase.host }
+      if (testCase.native === true) headers.cookie = NATIVE_SESSION
+      if (testCase.header !== undefined) headers[HEADER_NAME] = testCase.header
       assert.equal(connection.requestRejection({ headers }), testCase.expected)
-      assert.equal(connection.rejectionCalls, 1, 'original requestRejection runs exactly once')
+      assert.equal(connection.rejectionCalls, 1, 'the upstream method runs exactly once')
       ctx.dispose()
     })
   }
 
-  it('never calls the original with a different receiver contract', () => {
-    const connection = new FakeConnection({ rejectionResult: 401 })
-    activate(connection)
-    connection.requestRejection({ headers: { [HEADER_NAME]: SECRET } })
-    assert.equal(connection.rejectionCalls, 1)
+  it('passes an unexpected upstream status through unchanged', () => {
+    const connection = new FakeConnection()
+    // Correct semantics for the startup probe (no proxy header), an unexpected
+    // status otherwise.
+    connection.semantics = (request) => (
+      readHeader(request?.headers, HEADER_NAME) === undefined ? connection.evaluate(request) : 418
+    )
+    const ctx = activate(connection)
+    assert.equal(
+      connection.requestRejection({ headers: { host: LOOPBACK_HOST, [HEADER_NAME]: SECRET } }),
+      418,
+    )
+    ctx.dispose()
   })
 })
 
 describe('authorizeIndex', () => {
   it('valid secret + trust 401 -> true without calling the original authorizeIndex', () => {
-    const connection = new FakeConnection({ rejectionResult: 401 })
+    const connection = new FakeConnection()
     const ctx = activate(connection)
     const response = fakeResponse()
-    assert.equal(connection.authorizeIndex({ headers: { [HEADER_NAME]: SECRET } }, response), true)
+    assert.equal(connection.authorizeIndex({ headers: { host: LOOPBACK_HOST, [HEADER_NAME]: SECRET } }, response), true)
     assert.equal(connection.indexCalls, 0)
     assert.equal(response.ended, false)
     ctx.dispose()
   })
 
   it('valid secret + trust undefined -> true', () => {
-    const connection = new FakeConnection({ rejectionResult: undefined })
+    const connection = new FakeConnection()
     activate(connection)
-    assert.equal(connection.authorizeIndex({ headers: { [HEADER_NAME]: SECRET } }, fakeResponse()), true)
+    assert.equal(
+      connection.authorizeIndex(
+        { headers: { host: LOOPBACK_HOST, cookie: NATIVE_SESSION, [HEADER_NAME]: SECRET } },
+        fakeResponse(),
+      ),
+      true,
+    )
   })
 
   it('valid secret + trust 403 -> false, HTTP 403, response ended', () => {
-    const connection = new FakeConnection({ rejectionResult: 403 })
+    const connection = new FakeConnection()
     activate(connection)
     const response = fakeResponse()
-    assert.equal(connection.authorizeIndex({ headers: { [HEADER_NAME]: SECRET } }, response), false)
+    assert.equal(
+      connection.authorizeIndex({ headers: { host: 'evil.example', [HEADER_NAME]: SECRET } }, response),
+      false,
+    )
     assert.equal(response.status, 403)
     assert.equal(response.headers['cache-control'], 'no-store')
     assert.equal(response.headers['content-type'], 'text/plain; charset=utf-8')
@@ -168,19 +285,19 @@ describe('authorizeIndex', () => {
   })
 
   it('missing secret delegates to the original authorizeIndex', () => {
-    const connection = new FakeConnection({ rejectionResult: 401 })
+    const connection = new FakeConnection()
     activate(connection)
     const response = fakeResponse()
-    assert.equal(connection.authorizeIndex({ headers: {} }, response), false)
+    assert.equal(connection.authorizeIndex({ headers: { host: LOOPBACK_HOST } }, response), false)
     assert.equal(connection.indexCalls, 1)
     assert.equal(response.status, 401)
   })
 
   it('wrong secret delegates to the original authorizeIndex', () => {
-    const connection = new FakeConnection({ rejectionResult: 401 })
+    const connection = new FakeConnection()
     activate(connection)
     const response = fakeResponse()
-    assert.equal(connection.authorizeIndex({ headers: { [HEADER_NAME]: 'nope' } }, response), false)
+    assert.equal(connection.authorizeIndex({ headers: { host: LOOPBACK_HOST, [HEADER_NAME]: 'nope' } }, response), false)
     assert.equal(connection.indexCalls, 1)
     assert.equal(response.status, 401)
   })
@@ -203,8 +320,8 @@ describe('header parsing', () => {
     assert.equal(rejectWith({}).result, 401)
   })
 
-  it('rejects a missing headers object', () => {
-    assert.equal(rejectWith(undefined).result, 401)
+  it('fails closed when the request carries no headers at all', () => {
+    assert.equal(rejectWith(undefined).result, 403)
   })
 
   it('rejects an array-valued header', () => {
@@ -224,18 +341,18 @@ describe('header parsing', () => {
   })
 
   it('accepts a Fetch Headers instance found case-insensitively', () => {
-    const headers = new Headers({ 'X-DSH-Proxy-Auth': SECRET })
+    const headers = new Headers({ Host: LOOPBACK_HOST, 'X-DSH-Proxy-Auth': SECRET })
     assert.equal(rejectWith(headers).result, undefined)
   })
 
   it('rejects a Fetch Headers instance with a different value', () => {
-    const headers = new Headers({ 'X-DSH-Proxy-Auth': 'wrong' })
+    const headers = new Headers({ Host: LOOPBACK_HOST, 'X-DSH-Proxy-Auth': 'wrong' })
     assert.equal(rejectWith(headers).result, 401)
   })
 })
 
 describe('configuration', () => {
-  const connection = () => new FakeConnection({ rejectionResult: 401 })
+  const connection = () => new FakeConnection()
 
   it('fails when the secret is missing', () => {
     delete process.env[SECRET_ENV]
@@ -250,6 +367,33 @@ describe('configuration', () => {
   it('fails when the secret is shorter than the minimum', () => {
     process.env[SECRET_ENV] = 'x'.repeat(MIN_SECRET_BYTES - 1)
     assert.throws(() => apply(fakeContext(connection())), /at least 32 bytes/)
+  })
+
+  it('fails when the secret contains a comma', () => {
+    process.env[SECRET_ENV] = `${'a'.repeat(MIN_SECRET_BYTES - 1)},`
+    assert.throws(() => apply(fakeContext(connection())), /printable ASCII characters other than comma/)
+  })
+
+  it('fails when the secret contains whitespace', () => {
+    process.env[SECRET_ENV] = `${'a'.repeat(MIN_SECRET_BYTES - 1)} `
+    assert.throws(() => apply(fakeContext(connection())), /printable ASCII characters other than comma/)
+  })
+
+  it('fails when the secret contains a non-ASCII character', () => {
+    process.env[SECRET_ENV] = `${'a'.repeat(MIN_SECRET_BYTES - 1)}é`
+    assert.throws(() => apply(fakeContext(connection())), /printable ASCII characters other than comma/)
+  })
+
+  it('accepts a base64-style secret', () => {
+    process.env[SECRET_ENV] = 'aB0+/='.repeat(6)
+    const ctx = fakeContext(connection())
+    apply(ctx)
+    ctx.dispose()
+  })
+
+  it('fails when ctx.effect is unavailable', () => {
+    process.env[SECRET_ENV] = SECRET
+    assert.throws(() => apply({ connection: connection() }), /ctx\.effect is not available/)
   })
 
   it('fails when the connection service is missing', () => {
@@ -291,11 +435,77 @@ describe('configuration', () => {
     assert.throws(() => apply(fakeContext(connection)), /could not be decorated/)
     assert.equal(Object.hasOwn(connection, 'requestRejection'), false, 'partial decoration is rolled back')
   })
+
+  it('undoes a mutation that landed but failed verification', () => {
+    process.env[SECRET_ENV] = SECRET
+    const target = new FakeConnection()
+    // Simulate an incompatible future Cordis proxy: the write reaches the
+    // target, but the descriptor read cannot see it, so verification fails.
+    const connection = new Proxy(target, {
+      getOwnPropertyDescriptor(object, property) {
+        if (property === 'requestRejection') return undefined
+        return Reflect.getOwnPropertyDescriptor(object, property)
+      },
+    })
+    assert.throws(() => apply(fakeContext(connection)), /could not be decorated/)
+    assert.equal(Object.hasOwn(target, 'requestRejection'), false, 'the landed mutation is undone')
+    assert.equal(
+      target.requestRejection,
+      FakeConnection.prototype.requestRejection,
+      'the prototype method is intact',
+    )
+  })
+
+  it('rolls back installed wrappers when ctx.effect fails', () => {
+    process.env[SECRET_ENV] = SECRET
+    const connection = new FakeConnection()
+    const ctx = fakeContext(connection)
+    ctx.effect = () => {
+      throw new Error('effect registration failed')
+    }
+    assert.throws(() => apply(ctx), /effect registration failed/)
+    assert.equal(Object.hasOwn(connection, 'requestRejection'), false)
+    assert.equal(Object.hasOwn(connection, 'authorizeIndex'), false)
+    assert.equal(connection.requestRejection, FakeConnection.prototype.requestRejection)
+  })
+})
+
+describe('startup semantic invariant', () => {
+  it('fails when the Host fence no longer returns 403', () => {
+    process.env[SECRET_ENV] = SECRET
+    const connection = new FakeConnection({ semantics: () => 401 })
+    assert.throws(() => apply(fakeContext(connection)), /unsupported DSH requestRejection semantics/)
+    assert.equal(Object.hasOwn(connection, 'requestRejection'), false, 'nothing is decorated')
+  })
+
+  it('fails when an unauthenticated loopback request is not 401', () => {
+    process.env[SECRET_ENV] = SECRET
+    const connection = new FakeConnection({ semantics: () => undefined })
+    assert.throws(() => apply(fakeContext(connection)), /unsupported DSH requestRejection semantics/)
+  })
+
+  it('probes the original method even when a wrapper is already installed', () => {
+    process.env[SECRET_ENV] = SECRET
+    const connection = new FakeConnection()
+    // A wrapper that would wrongly promote everything, tagged as ours.
+    const foreign = function foreignWrapper() {
+      return undefined
+    }
+    Object.defineProperty(foreign, INNER, {
+      value: { original: FakeConnection.prototype.requestRejection, originalWasOwn: false },
+      enumerable: false,
+    })
+    connection.requestRejection = foreign
+    // Activation must probe the real original (which returns 401/403), so it
+    // must succeed rather than trust the installed wrapper's semantics.
+    const ctx = activate(connection)
+    ctx.dispose()
+  })
 })
 
 describe('lifecycle', () => {
   it('installs an instance wrapper and leaves the prototype untouched', () => {
-    const connection = new FakeConnection({ rejectionResult: 401 })
+    const connection = new FakeConnection()
     activate(connection)
     assert.equal(Object.hasOwn(connection, 'requestRejection'), true)
     assert.equal(Object.hasOwn(connection, 'authorizeIndex'), true)
@@ -308,19 +518,25 @@ describe('lifecycle', () => {
   })
 
   it('cleanup restores the exact original shape for inherited methods', () => {
-    const connection = new FakeConnection({ rejectionResult: 401 })
+    const connection = new FakeConnection()
     const ctx = activate(connection)
     ctx.dispose()
     assert.equal(Object.hasOwn(connection, 'requestRejection'), false)
     assert.equal(Object.hasOwn(connection, 'authorizeIndex'), false)
     assert.equal(connection.requestRejection, FakeConnection.prototype.requestRejection)
     assert.equal(connection.authorizeIndex, FakeConnection.prototype.authorizeIndex)
-    assert.equal(connection.requestRejection({ headers: { [HEADER_NAME]: SECRET } }), 401)
+    assert.equal(
+      connection.requestRejection({ headers: { host: LOOPBACK_HOST, [HEADER_NAME]: SECRET } }),
+      401,
+    )
   })
 
   it('cleanup restores own-property methods as own properties', () => {
-    const original = function requestRejection() {
-      return 401
+    // An own-property method that still implements DSH's semantics, so the
+    // startup probe succeeds and the test exercises restoration only.
+    const reference = new FakeConnection()
+    const original = function requestRejection(request) {
+      return reference.evaluate(request)
     }
     const connection = { requestRejection: original, authorizeIndex() {} }
     const ctx = activate(connection)
@@ -331,18 +547,21 @@ describe('lifecycle', () => {
   })
 
   it('apply -> cleanup -> apply does not stack wrappers', () => {
-    const connection = new FakeConnection({ rejectionResult: 401 })
+    const connection = new FakeConnection()
     const first = activate(connection)
     first.dispose()
     const second = activate(connection)
-    assert.equal(connection.requestRejection({ headers: { [HEADER_NAME]: SECRET } }), undefined)
+    assert.equal(
+      connection.requestRejection({ headers: { host: LOOPBACK_HOST, [HEADER_NAME]: SECRET } }),
+      undefined,
+    )
     assert.equal(connection.rejectionCalls, 1, 'the upstream method is reached exactly once')
     second.dispose()
     assert.equal(Object.hasOwn(connection, 'requestRejection'), false)
   })
 
   it('two overlapping activations converge to the pristine object on cleanup', () => {
-    const connection = new FakeConnection({ rejectionResult: 401 })
+    const connection = new FakeConnection()
     const a = activate(connection)
     const b = activate(connection)
     a.dispose()
@@ -356,11 +575,31 @@ describe('lifecycle', () => {
     d.dispose()
     c.dispose()
     assert.equal(Object.hasOwn(connection, 'requestRejection'), false)
-    assert.equal(connection.requestRejection({ headers: { [HEADER_NAME]: SECRET } }), 401)
+    assert.equal(
+      connection.requestRejection({ headers: { host: LOOPBACK_HOST, [HEADER_NAME]: SECRET } }),
+      401,
+    )
+  })
+
+  it('unwraps a wrapper carrying the shared global marker from another generation', () => {
+    const connection = new FakeConnection()
+    const foreign = function foreignWrapper() {
+      return 401
+    }
+    Object.defineProperty(foreign, INNER, {
+      value: { original: FakeConnection.prototype.requestRejection, originalWasOwn: false },
+      enumerable: false,
+    })
+    connection.requestRejection = foreign
+    const ctx = activate(connection)
+    assert.notEqual(connection.requestRejection, foreign, 'the foreign wrapper is replaced')
+    ctx.dispose()
+    assert.equal(Object.hasOwn(connection, 'requestRejection'), false)
+    assert.equal(connection.requestRejection, FakeConnection.prototype.requestRejection)
   })
 
   it('leaves authenticatedUrl untouched', () => {
-    const connection = new FakeConnection({ rejectionResult: 401 })
+    const connection = new FakeConnection()
     const before = connection.authenticatedUrl
     const ctx = activate(connection)
     assert.equal(connection.authenticatedUrl, before)
@@ -369,10 +608,10 @@ describe('lifecycle', () => {
   })
 
   it('never logs the secret or header contents', () => {
-    const connection = new FakeConnection({ rejectionResult: 401 })
+    const connection = new FakeConnection()
     const ctx = activate(connection)
-    connection.requestRejection({ headers: { [HEADER_NAME]: SECRET } })
-    connection.authorizeIndex({ headers: { [HEADER_NAME]: 'wrong' } }, fakeResponse())
+    connection.requestRejection({ headers: { host: LOOPBACK_HOST, [HEADER_NAME]: SECRET } })
+    connection.authorizeIndex({ headers: { host: LOOPBACK_HOST, [HEADER_NAME]: 'wrong' } }, fakeResponse())
     const text = ctx.log.join('\n')
     assert.ok(text.includes('trusted-proxy-auth: activated'))
     assert.equal(text.includes(SECRET), false)

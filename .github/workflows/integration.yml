@@ -1,9 +1,15 @@
 name: integration
 
-# Boots a real DeepSeek Harness Web server with the plugin installed in a
-# throwaway DSH_HOME. Run manually or on a weekly schedule; it depends on the
-# published @deepseek-ai/dsh package and on pnpm being installable.
+# Two tracks:
+#   pinned  — runs on every push/PR against the DSH version this plugin was
+#             validated against, so upstream drift cannot merge unnoticed.
+#   latest  — runs on the weekly schedule (and manual dispatch) against
+#             @deepseek-ai/dsh@latest as an early-warning system for upstream
+#             changes that break the runtime contract.
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
   schedule:
     - cron: '0 6 * * 1'
@@ -11,16 +17,36 @@ on:
 permissions:
   contents: read
 
+env:
+  DSH_TELEMETRY_DISABLED: '1'
+
 jobs:
-  real-dsh:
-    name: real DSH integration (node 24)
+  pinned:
+    name: real DSH (pinned 0.1.5-rc.2)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - name: Install dsh and pnpm
-        run: npm install --global @deepseek-ai/dsh pnpm
+      - name: Install DSH 0.1.5-rc.2 and pnpm
+        run: npm install --global pnpm @deepseek-ai/dsh@0.1.5-rc.2
+      - name: Run integration tests
+        run: npm run test:integration
+
+  latest:
+    name: real DSH (@latest drift watch)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install DSH @latest and pnpm
+        run: npm install --global pnpm @deepseek-ai/dsh@latest
       - name: Run integration tests
         run: npm run test:integration

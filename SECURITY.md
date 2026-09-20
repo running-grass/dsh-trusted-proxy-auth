@@ -24,10 +24,12 @@ never converts a `403` (DSH's Host/Origin/DNS-rebinding fence) into a permit.
 | --- | --- |
 | Attacker guesses the secret | Minimum 32 bytes; compare with `crypto.timingSafeEqual()`; use `openssl rand -hex 48`. |
 | Timing side channel on comparison | Constant-time comparison over UTF-8 bytes. |
-| Header smuggling / ambiguity | Malformed, duplicated, array-valued, combined, or non-string header values fail authentication. |
+| Header smuggling / ambiguity | Malformed, duplicated, array-valued, combined, or non-string header values fail authentication. The accepted secret charset excludes comma and whitespace, so a joined duplicate can never equal the secret. |
 | DNS rebinding to the DSH port | The upstream Host/Origin fence still returns `403` even with a valid secret. |
 | Cross-site requests from a malicious page | `Origin` mismatch and `Sec-Fetch-Site: cross-site` still return `403`. |
 | Client-supplied identity headers (`X-Forwarded-User`, etc.) | Never read; only the shared secret is considered. |
+| Secret sniffed on the proxy→DSH hop | The hop must sit on an isolated trusted network or be encrypted (TLS/mTLS or an encrypted overlay); it carries a bearer secret in clear text over plain HTTP. |
+| A future DSH reorders the `403`/`401` statuses | Activation probes the original `requestRejection` and fails unless the trust fence still returns `403` and missing browser auth still returns `401`. |
 | Secret leaking into logs | The plugin never logs the secret, header values, cookies, or tokens. |
 | Secret leaking into configuration files | The secret is read only from the environment and is never a plugin config key. |
 | Partial activation leaving a half-decorated service | Activation fails loudly and rolls back any partial decoration; the profile fails to boot. |
@@ -42,12 +44,19 @@ secret bypasses native authentication. Therefore:
 
 1. Firewall the DSH listen port so only the reverse proxy / cluster network can
    reach it.
-2. Keep `DSH_PROXY_AUTH_SECRET` out of source control, YAML, and logs.
-3. Ensure the proxy **overwrites** any inbound `X-DSH-Proxy-Auth` header so a
+2. Keep the proxy→DSH hop on an isolated trusted network segment or encrypt it
+   (TLS, ideally mTLS, or an encrypted overlay such as WireGuard or
+   VXLAN+IPsec). The header is a bearer secret; over plain HTTP any passive
+   observer of that path can replay it. If isolation is the chosen control,
+   record that assumption explicitly for the deployment.
+3. Keep `DSH_PROXY_AUTH_SECRET` out of source control, YAML, and logs.
+4. Ensure the proxy **overwrites** any inbound `X-DSH-Proxy-Auth` header so a
    client cannot inject its own value.
-4. Serve the public entry point over TLS; the native DSH flow and the shared
+5. Serve the public entry point over TLS; the native DSH flow and the shared
    secret both assume a trusted transport.
-5. Restrict read access to the environment file (for example `root:dsh 0640`).
+6. Restrict read access to the environment file (for example `root:dsh 0640`).
+7. Pin the installed plugin revision to a reviewed tag or commit, and re-run the
+   smoke tests after a DSH upgrade.
 
 ## Scope
 

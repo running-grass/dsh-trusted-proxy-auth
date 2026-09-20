@@ -42,8 +42,10 @@ SSH tunnel / direct access
 
 - Tested against **DSH 0.1.5-rc.2** on **Node v24.21.0** (Node 20 and 22 are
   covered by CI).
-- 39 unit tests and 35 live-DSH integration checks pass. See
+- 50 unit tests and 35 live-DSH integration checks pass. See
   [`docs/VALIDATION.md`](docs/VALIDATION.md).
+- A startup invariant re-proves DSH's `403`/`401` semantics on every boot, so a
+  semantics change cannot silently turn the plugin into a bypass.
 - No runtime dependencies — only `node:crypto`.
 - No build step; plain ESM.
 
@@ -71,11 +73,18 @@ Install the plugin bundle into the Web profile and restart:
 # from a Git checkout
 dsh plugin --profile web add /path/to/dsh-trusted-proxy-auth
 
-# or directly from this repository
-dsh plugin --profile web add git+https://github.com/lukepoo101/dsh-trusted-proxy-auth.git
+# or directly from this repository, pinned to the released tag
+dsh plugin --profile web add git+https://github.com/lukepoo101/dsh-trusted-proxy-auth.git#v0.1.0
+
+# an exact commit is equally acceptable for an authentication-boundary plugin
+dsh plugin --profile web add git+https://github.com/lukepoo101/dsh-trusted-proxy-auth.git#<40-char-commit>
 
 sudo systemctl restart deepseek-harness
 ```
+
+Pin the tag or commit rather than following `main`: this plugin sits on the
+authentication boundary, so the installed revision should be the one you
+reviewed. Bump it deliberately when you upgrade.
 
 Verify the composed profile contains the plugin **in addition to** the
 Connection transport:
@@ -103,12 +112,15 @@ dsh web --trusted-host dsh.example.com
 
 | Setting | Where | Notes |
 | --- | --- | --- |
-| `DSH_PROXY_AUTH_SECRET` | environment | **Required.** At least 32 bytes. Never put it in YAML. |
+| `DSH_PROXY_AUTH_SECRET` | environment | **Required.** At least 32 bytes of printable ASCII other than comma. Never put it in YAML. |
 | `X-DSH-Proxy-Auth` | request header | Injected by the reverse proxy only. Never sent to the browser. |
 
-There are no plugin configuration keys. A missing, empty, or too-short secret
-makes plugin activation fail loudly, which makes the profile fail to boot — the
-server never starts half-authenticated.
+There are no plugin configuration keys. A missing, empty, too-short, or
+malformed secret makes plugin activation fail loudly, which makes the profile
+fail to boot — the server never starts half-authenticated. `openssl rand -hex 48`
+(hex) and `openssl rand -base64 48` both satisfy the accepted character set;
+excluding comma and whitespace is what makes the duplicate/joined-header
+guarantee unambiguous.
 
 ## Behaviour
 
@@ -175,6 +187,16 @@ The DSH service must include the final public authority in `--trusted-host`:
 --trusted-host dsh.example.com
 ```
 
+**The proxy→DSH hop carries the secret in clear text.** The example above
+forwards to `http://10.0.20.103:3081`; anything that can passively observe that
+path can recover `X-DSH-Proxy-Auth` and replay it. Firewalling blocks unwanted
+connections but does not prevent sniffing, so do one of the following:
+
+- keep the hop on an isolated trusted network segment or encrypted overlay
+  (WireGuard, VXLAN+IPsec) **and document that as an explicit deployment
+  assumption**; or
+- terminate TLS — ideally mTLS — between the proxy and DSH.
+
 **Network restriction is still required.** The shared secret is
 defence-in-depth, not a replacement for a firewall: anyone who can reach the
 DSH port directly *and* knows the secret bypasses native authentication.
@@ -199,9 +221,9 @@ systemctl status deepseek-harness
 journalctl -u deepseek-harness -n 100
 ```
 
-If a future DSH renames or removes `requestRejection` or `authorizeIndex`, the
-plugin refuses to activate and the profile fails to boot, rather than silently
-dropping authentication.
+If a future DSH renames or removes `requestRejection` / `authorizeIndex`, or
+changes their `403`/`401` semantics, the plugin refuses to activate and the
+profile fails to boot, rather than silently dropping authentication.
 
 **Uninstall.**
 
@@ -219,19 +241,27 @@ sudo systemctl restart deepseek-harness
 - A malformed, duplicated, array-valued, combined, or non-string header fails
   authentication.
 - The secret, the header value, cookies, and launch tokens are never logged.
+- The secret must be printable ASCII without comma or whitespace, so a
+  duplicate or joined HTTP header value can never equal it.
+- Every activation probes the original `requestRejection` and refuses to start
+  unless `403` still means the Host/Origin trust fence and `401` still means
+  "native browser session missing". A DSH upgrade that changes those semantics
+  fails the profile instead of quietly becoming a bypass.
 - The plugin decorates only the single live `ctx.connection` instance; it never
   touches `HostConnectionService.prototype` and never writes inside the DSH
   installation.
-- Activation is fail-closed: a bad configuration stops the profile from
-  starting, and unexpected runtime exceptions preserve native authentication
-  or fail the request — never a silent `true`.
+- Activation is fail-closed and transactional: a bad configuration stops the
+  profile from starting, any partial decoration (including a write that failed
+  verification, or a disposer that failed to register) is rolled back, and
+  unexpected runtime exceptions preserve native authentication or fail the
+  request — never a silent `true`.
 
 See [`SECURITY.md`](SECURITY.md) for the full threat model.
 
 ## Testing
 
 ```bash
-npm test                 # 39 unit tests, node:test, no dependencies
+npm test                 # 50 unit tests, node:test, no dependencies
 npm run test:integration # 35 live checks against a real DSH server
 ```
 
@@ -242,6 +272,11 @@ Harness Web server on a free loopback port, and exercises the HTTP index route,
 fail-closed startup, and log hygiene. It never touches an existing Harness home
 or a running server. Use `KEEP_TMP=1` to keep the temporary home for
 inspection.
+
+CI has two tracks: the unit suite on Node 20/22/24 and the real-DSH integration
+suite run on every push and pull request against the pinned `0.1.5-rc.2`, while
+a scheduled job runs the same integration suite against
+`@deepseek-ai/dsh@latest` as an early-warning signal for upstream drift.
 
 ## Runtime compatibility
 
@@ -259,8 +294,17 @@ stable. The plugin therefore captures and restores methods through
 
 Cleanup is compare-and-swap and unwraps any wrapper it finds, so repeated or
 overlapping activation cannot stack wrappers and the instance returns exactly to
-its original shape (own property deleted when the method was inherited). See
-`docs/VALIDATION.md` for the raw probe output.
+its original shape (own property deleted when the method was inherited). The
+wrapper marker is a registered (`Symbol.for`) symbol, so two generations of the
+module loaded at once still recognise each other. See `docs/VALIDATION.md` for
+the raw probe output.
+
+Shape is not the whole contract, so activation also asserts DSH's **semantics**
+against the original method: an unauthenticated loopback request must be `401`,
+an untrusted Host must be `403`, and cross-origin/cross-site requests must be
+`403`. If a future DSH ever authenticated before applying the trust fence — so
+an untrusted Host returned `401` — promoting that `401` would no longer be safe,
+and the plugin refuses to start.
 
 ## Non-goals
 
