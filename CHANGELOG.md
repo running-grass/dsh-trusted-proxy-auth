@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-09-25
+
+### Added
+
+- Loopback normalisation for third-party plugin routes:
+  - Decorates `webServer.handle` to normalise incoming proxy-authenticated requests
+    to the local loopback authority (`127.0.0.1:<port>`).
+  - Enables third-party plugins with strict loopback/same-origin checks (such as
+    `dshmarket@1.65.1` protecting `/dsh-market/discovery-compatibility`,
+    `/dsh-market/update`, etc.) to work seamlessly across reverse-proxied domains.
+  - Strict security fence: evaluates DSH's native Host/Origin/Cross-Site checks
+    (`requestRejection`) against real inbound headers *before* normalising;
+    cross-origin CSRF attacks, cross-site fetch metadata, or untrusted Hosts are
+    immediately rejected with HTTP 403 Forbidden and never reach downstream handlers.
+  - Preserves the incoming public authority in `X-Forwarded-Host` and
+    `X-Forwarded-Proto`.
+- Extensive third-party plugin test coverage:
+  - 23 new unit tests covering `dshmarket` discovery and mutation endpoints,
+    multiple plugins registering diverse routes (exact and prefix), CSRF prevention,
+    custom ports, query parameters, other HTTP methods, and lifecycle cleanup
+    (85 unit tests pass).
+
+### Changed
+
+- Cleaned up deprecated `attachBootstrapInjection` stub to keep the codebase concise
+  and maintainable.
+- Generalised `captureMethod` and `installWrapper` with `targetName` parameter for
+  uniform transactional decoration across `connection` and `webServer`.
+
 ## [0.2.1] - 2026-09-25
 
 ### Fixed

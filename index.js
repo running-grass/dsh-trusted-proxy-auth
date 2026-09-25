@@ -4,9 +4,11 @@
  * trusted reverse proxy (for example Traefik terminating Keycloak OIDC).
  *
  * The plugin does not replace DSH's transport and does not implement any
- * OIDC/JWT logic. It decorates the live `ctx.connection` service so that a
- * request carrying a private shared secret — injected by the reverse proxy
- * only after it has authenticated the caller — is treated as authenticated,
+ * OIDC/JWT logic. It decorates the live `ctx.connection` and `ctx.webServer`
+ * services so that a request carrying a private shared secret — injected by
+ * the reverse proxy only after it has authenticated the caller — is treated
+ * as authenticated, loopback-normalised for third-party plugin routes (such as
+ * dshmarket), and bootstrap-injected with host-privileged settings persistence,
  * while native DSH launch-token/cookie authentication keeps working as a
  * fallback for direct loopback/SSH access.
  *
@@ -176,10 +178,10 @@ function readMethod(target, property) {
  * @returns the effective original method and whether it was an own property.
  * @throws when the method is missing or not a function.
  */
-function captureMethod(connection, property) {
-  const found = readMethod(connection, property)
+function captureMethod(target, property, targetName = 'connection') {
+  const found = readMethod(target, property)
   if (found === undefined || typeof found.value !== 'function') {
-    throw new Error(`${LOG_PREFIX}: unsupported DSH connection interface: ${property} is not a function`)
+    throw new Error(`${LOG_PREFIX}: unsupported DSH ${targetName} interface: ${property} is not a function`)
   }
   const decorated = found.value[INNER]
   if (decorated === undefined) return { property, original: found.value, originalWasOwn: found.own }
@@ -187,8 +189,8 @@ function captureMethod(connection, property) {
 }
 
 /**
- * Install one wrapper as an own property of the connection instance and
- * return a cleanup function.
+ * Install one wrapper as an own property of the target instance and return
+ * a cleanup function.
  *
  * Installation is transactional: if the assignment takes effect but
  * verification fails, the mutation is undone before this function throws, so
@@ -199,37 +201,38 @@ function captureMethod(connection, property) {
  * originally inherited from the prototype, so the object's shape returns to
  * exactly what upstream created.
  *
- * @param connection - the `ctx.connection` service.
+ * @param target - the service instance (e.g. `ctx.connection` or `ctx.webServer`).
  * @param captured - result of {@link captureMethod}.
  * @param wrapper - replacement function to install.
+ * @param targetName - name of service for error reporting (default: 'connection').
  * @returns a function restoring the original state.
  * @throws when the wrapper cannot be verified as installed.
  */
-function installWrapper(connection, captured, wrapper) {
+function installWrapper(target, captured, wrapper, targetName = 'connection') {
   Object.defineProperty(wrapper, INNER, {
     value: { original: captured.original, originalWasOwn: captured.originalWasOwn },
     enumerable: false,
   })
   const restore = () => {
-    const current = readMethod(connection, captured.property)
+    const current = readMethod(target, captured.property)
     if (current === undefined || current.value !== wrapper) return
-    if (captured.originalWasOwn) connection[captured.property] = captured.original
-    else delete connection[captured.property]
+    if (captured.originalWasOwn) target[captured.property] = captured.original
+    else delete target[captured.property]
   }
   const rollback = () => {
-    if (captured.originalWasOwn) connection[captured.property] = captured.original
-    else delete connection[captured.property]
+    if (captured.originalWasOwn) target[captured.property] = captured.original
+    else delete target[captured.property]
   }
   const unsupported = () => new Error(
-    `${LOG_PREFIX}: unsupported DSH connection interface: ${captured.property} could not be decorated`,
+    `${LOG_PREFIX}: unsupported DSH ${targetName} interface: ${captured.property} could not be decorated`,
   )
   try {
     try {
-      connection[captured.property] = wrapper
+      target[captured.property] = wrapper
     } catch {
       throw unsupported()
     }
-    const installed = readMethod(connection, captured.property)
+    const installed = readMethod(target, captured.property)
     if (installed === undefined || installed.value !== wrapper) throw unsupported()
   } catch (error) {
     // Verification can fail after the write landed (for example if a future
@@ -313,15 +316,59 @@ export function resolveWebServer(ctx) {
 }
 
 /**
- * No-op retained for backwards compatibility.
+ * Normalise request Host and Origin headers to loopback authority so that
+ * third-party plugins with loopback-only route checks (for example dshmarket
+ * sameOrigin checks) accept proxy-authenticated requests.
  *
- * Bootstrap injection is handled via webServer.tapIndex and webserver/index-inject
- * rather than mutating Node's ServerResponse.
+ * Preserves the original authority in X-Forwarded-Host and X-Forwarded-Proto.
  *
- * @deprecated
+ * @param request - HTTP request with headers.
+ * @param port - loopback port number (default: 3080).
  */
-export function attachBootstrapInjection(response) {
-  // Deliberately no-op to preserve DSH's native HTTP response pipeline.
+export function normalizeToLoopback(request, port = 3080) {
+  const loopbackHost = port === 80 ? '127.0.0.1' : `127.0.0.1:${port}`
+  const headers = request?.headers
+  if (!headers) return
+
+  if (typeof Headers === 'function' && headers instanceof Headers) {
+    const originalHost = headers.get('host')
+    if (originalHost && !headers.has('x-forwarded-host')) {
+      headers.set('x-forwarded-host', originalHost)
+    }
+    if (!headers.has('x-forwarded-proto')) {
+      headers.set('x-forwarded-proto', 'https')
+    }
+    headers.set('host', loopbackHost)
+    if (headers.has('origin')) {
+      headers.set('origin', `http://${loopbackHost}`)
+    }
+    return
+  }
+
+  if (typeof headers === 'object') {
+    let originalHost
+    for (const key of Object.keys(headers)) {
+      const lower = key.toLowerCase()
+      if (lower === 'host') {
+        if (!originalHost) originalHost = headers[key]
+        if (key !== 'host') delete headers[key]
+      } else if (lower === 'origin' && key !== 'origin') {
+        const val = headers[key]
+        delete headers[key]
+        headers.origin = val
+      }
+    }
+    if (!headers['x-forwarded-host'] && originalHost) {
+      headers['x-forwarded-host'] = originalHost
+    }
+    if (!headers['x-forwarded-proto']) {
+      headers['x-forwarded-proto'] = 'https'
+    }
+    headers.host = loopbackHost
+    if (headers.origin !== undefined) {
+      headers.origin = `http://${loopbackHost}`
+    }
+  }
 }
 
 /**
@@ -454,13 +501,34 @@ export function apply(ctx) {
       return false
     }))
 
-    // Register bootstrap injection via supported DSH webServer seams:
-    // 1. webServer.tapIndex (raw HTML transform on index responses)
+    // Decorate webServer if available:
+    // 1. webServer.handle: normalize proxy-authenticated requests to loopback for
+    // third-party plugin routes (e.g. dshmarket sameOrigin checks)
     const webServer = resolveWebServer(ctx)
-    if (webServer && typeof webServer.tapIndex === 'function') {
-      const unregisterTap = webServer.tapIndex((html) => injectBootstrapHtml(html))
-      if (typeof unregisterTap === 'function') {
-        restores.push(unregisterTap)
+    if (webServer) {
+      if (typeof webServer.handle === 'function') {
+        const capturedHandle = captureMethod(webServer, 'handle', 'webServer')
+        restores.push(installWrapper(webServer, capturedHandle, async function handle(request, response) {
+          if (!hasValidSecret(request)) {
+            return capturedHandle.original.call(webServer, request, response)
+          }
+          // The proxy established identity; the Host/Origin fence still applies.
+          const result = rejection.original.call(connection, request)
+          if (result !== undefined && result !== 401) {
+            writeForbidden(response)
+            return
+          }
+          normalizeToLoopback(request, webServer.port ?? 3080)
+          return capturedHandle.original.call(webServer, request, response)
+        }, 'webServer'))
+      }
+
+      // 2. webServer.tapIndex (raw HTML transform on index responses)
+      if (typeof webServer.tapIndex === 'function') {
+        const unregisterTap = webServer.tapIndex((html) => injectBootstrapHtml(html))
+        if (typeof unregisterTap === 'function') {
+          restores.push(unregisterTap)
+        }
       }
     }
 

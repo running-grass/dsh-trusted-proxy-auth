@@ -42,13 +42,16 @@ SSH tunnel / direct access
 
 - Tested against **DSH 0.1.5-rc.2** on **Node v24.21.0** (Node 20 and 22 are
   covered by CI).
-- 60 unit tests and 37 live-DSH integration checks pass. See
+- 85 unit tests and 37 live-DSH integration checks pass. See
   [`docs/VALIDATION.md`](docs/VALIDATION.md).
 - A startup invariant re-proves DSH's `403`/`401` semantics on every boot, so a
   semantics change cannot silently turn the plugin into a bypass.
 - Injects a server-verified `__DSH_TRANSPORT__.ownsHost = true` bootstrap into
   the index HTML for proxy-authenticated requests, enabling full host settings
   persistence (Models catalog, Plugins configuration) across remote origins.
+- Normalises proxy-authenticated requests to loopback for `webServer.handle` routes,
+  enabling third-party plugins with strict loopback checks (e.g. `dshmarket`) to work
+  seamlessly while strictly preventing cross-origin CSRF attacks.
 - No runtime dependencies — only `node:crypto`.
 - No build step; plain ESM.
 
@@ -77,7 +80,7 @@ Install the plugin bundle into the Web profile and restart:
 dsh plugin --profile web add /path/to/dsh-trusted-proxy-auth
 
 # or directly from this repository, pinned to the released tag
-dsh plugin --profile web add git+https://github.com/lukepoo101/dsh-trusted-proxy-auth.git#v0.2.1
+dsh plugin --profile web add git+https://github.com/lukepoo101/dsh-trusted-proxy-auth.git#v0.2.2
 
 # an exact commit is equally acceptable for an authentication-boundary plugin
 dsh plugin --profile web add git+https://github.com/lukepoo101/dsh-trusted-proxy-auth.git#<40-char-commit>
@@ -174,6 +177,33 @@ into `<head>` when rendering the web shell. DSH's connection package evaluates `
 setting `isLoopback = true` and activating `'host'` persistence for the proxy-authenticated
 operator session. Node's `ServerResponse` pipeline remains completely unmodified, ensuring standard
 HTTP chunked streaming and headers without truncation.
+
+### Third-party plugin route compatibility & loopback normalisation
+
+Several DSH plugins (most notably `dshmarket@1.65.1`, which powers the built-in Plugin Marketplace)
+protect their HTTP mutation routes (`/dsh-market/discovery-compatibility`, `/dsh-market/update`,
+`/dsh-market/install`) with a strict loopback check:
+
+```javascript
+const sameOrigin = (req) => isLoopback(req.headers.host) && (!req.headers.origin || req.headers.origin === `http://${req.headers.host}`)
+```
+
+When DSH is fronted by a reverse proxy, incoming requests carry the public domain (e.g. `Host: dsh.example.com`).
+Blindly rewriting `Origin` at the reverse proxy (e.g. via Nginx or Envoy) would strip CSRF defense across the board
+and risk exposing state-changing endpoints to malicious websites.
+
+To solve this safely and universally:
+1. `dsh-trusted-proxy-auth` intercepts incoming HTTP requests on `ctx.webServer.handle`.
+2. For requests carrying a valid `X-DSH-Proxy-Auth` header, it calls DSH's undecorated `connection.requestRejection(req)`
+   against the real inbound headers.
+3. If the request fails the Host/Origin fence (e.g. an attacker on `https://evil.example` triggering a cross-origin
+   CSRF request, or an untrusted Host header), it is **immediately rejected with HTTP 403 Forbidden** and response
+   ended without invoking downstream handlers or normalising headers.
+4. For verified proxy requests, the plugin:
+   - Preserves the original public authority in `X-Forwarded-Host` and `X-Forwarded-Proto`.
+   - Normalises `req.headers.host` to `127.0.0.1:<port>`.
+   - Normalises `req.headers.origin` (if present) to `http://127.0.0.1:<port>`.
+5. Downstream plugin route handlers run their loopback check against the normalized headers, succeeding with `200 OK`.
 
 ## Reverse-proxy contract
 

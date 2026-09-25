@@ -16,8 +16,8 @@ import {
   MIN_SECRET_BYTES,
   SECRET_ENV,
   apply,
-  attachBootstrapInjection,
   injectBootstrapHtml,
+  normalizeToLoopback,
   resolveWebServer,
 } from '../index.js'
 
@@ -48,13 +48,34 @@ function fakeContext(connection, options = {}) {
   const disposers = []
   const events = new Map()
   const webServer = options.webServer ?? {
+    port: 3080,
     taps: [],
+    routes: [],
     tapIndex(transform) {
       this.taps.push(transform)
       return () => {
         const idx = this.taps.indexOf(transform)
         if (idx !== -1) this.taps.splice(idx, 1)
       }
+    },
+    register(route) {
+      this.routes.push(route)
+      return () => {
+        const idx = this.routes.indexOf(route)
+        if (idx !== -1) this.routes.splice(idx, 1)
+      }
+    },
+    async handle(req, res) {
+      const url = req.url ?? '/'
+      const method = (req.method ?? 'GET').toUpperCase()
+      for (const route of this.routes) {
+        const pathMatches = route.path ? route.path === url : (route.prefix ? url.startsWith(route.prefix) : false)
+        const methodMatches = !route.method || route.method.toUpperCase() === method
+        if (pathMatches && methodMatches) {
+          return await route.handler(req, res)
+        }
+      }
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }).end('not found')
     },
   }
   return {
@@ -807,3 +828,668 @@ describe('lifecycle', () => {
     assert.equal(text.includes('wrong'), false)
   })
 })
+
+describe('normalizeToLoopback', () => {
+  it('normalizes plain object host and origin to default port 3080', () => {
+    const req = {
+      headers: {
+        host: 'dsh.terraurbs.com',
+        origin: 'https://dsh.terraurbs.com',
+      },
+    }
+    normalizeToLoopback(req)
+    assert.equal(req.headers.host, '127.0.0.1:3080')
+    assert.equal(req.headers.origin, 'http://127.0.0.1:3080')
+    assert.equal(req.headers['x-forwarded-host'], 'dsh.terraurbs.com')
+    assert.equal(req.headers['x-forwarded-proto'], 'https')
+  })
+
+  it('leaves origin undefined when not present in request', () => {
+    const req = {
+      headers: {
+        host: 'dsh.terraurbs.com',
+      },
+    }
+    normalizeToLoopback(req)
+    assert.equal(req.headers.host, '127.0.0.1:3080')
+    assert.equal(req.headers.origin, undefined)
+    assert.equal(req.headers['x-forwarded-host'], 'dsh.terraurbs.com')
+    assert.equal(req.headers['x-forwarded-proto'], 'https')
+  })
+
+  it('handles custom port and standard HTTP port 80', () => {
+    const req1 = { headers: { host: 'custom.example', origin: 'https://custom.example' } }
+    normalizeToLoopback(req1, 8080)
+    assert.equal(req1.headers.host, '127.0.0.1:8080')
+    assert.equal(req1.headers.origin, 'http://127.0.0.1:8080')
+
+    const req2 = { headers: { host: 'custom.example', origin: 'https://custom.example' } }
+    normalizeToLoopback(req2, 80)
+    assert.equal(req2.headers.host, '127.0.0.1')
+    assert.equal(req2.headers.origin, 'http://127.0.0.1')
+  })
+
+  it('preserves existing x-forwarded-host and x-forwarded-proto', () => {
+    const req = {
+      headers: {
+        host: 'dsh.terraurbs.com',
+        'x-forwarded-host': 'original.public.example',
+        'x-forwarded-proto': 'wss',
+      },
+    }
+    normalizeToLoopback(req)
+    assert.equal(req.headers.host, '127.0.0.1:3080')
+    assert.equal(req.headers['x-forwarded-host'], 'original.public.example')
+    assert.equal(req.headers['x-forwarded-proto'], 'wss')
+  })
+
+  it('handles Fetch Headers instances properly', () => {
+    const headers = new Headers({
+      Host: 'dsh.terraurbs.com',
+      Origin: 'https://dsh.terraurbs.com',
+    })
+    const req = { headers }
+    normalizeToLoopback(req)
+    assert.equal(headers.get('host'), '127.0.0.1:3080')
+    assert.equal(headers.get('origin'), 'http://127.0.0.1:3080')
+    assert.equal(headers.get('x-forwarded-host'), 'dsh.terraurbs.com')
+    assert.equal(headers.get('x-forwarded-proto'), 'https')
+  })
+
+  it('handles mixed-case keys in plain objects', () => {
+    const req = {
+      headers: {
+        Host: 'dsh.terraurbs.com',
+        Origin: 'https://dsh.terraurbs.com',
+      },
+    }
+    normalizeToLoopback(req)
+    assert.equal(req.headers.host, '127.0.0.1:3080')
+    assert.equal(req.headers.Host, undefined)
+    assert.equal(req.headers.origin, 'http://127.0.0.1:3080')
+    assert.equal(req.headers.Origin, undefined)
+  })
+
+  it('safely handles missing or empty headers', () => {
+    assert.doesNotThrow(() => normalizeToLoopback(undefined))
+    assert.doesNotThrow(() => normalizeToLoopback({}))
+    assert.doesNotThrow(() => normalizeToLoopback({ headers: null }))
+  })
+
+  it('is idempotent when called repeatedly', () => {
+    const req = {
+      headers: {
+        host: 'dsh.terraurbs.com',
+        origin: 'https://dsh.terraurbs.com',
+      },
+    }
+    normalizeToLoopback(req)
+    normalizeToLoopback(req)
+    assert.equal(req.headers.host, '127.0.0.1:3080')
+    assert.equal(req.headers.origin, 'http://127.0.0.1:3080')
+    assert.equal(req.headers['x-forwarded-host'], 'dsh.terraurbs.com')
+  })
+})
+
+describe('webServer third-party plugin route compatibility', () => {
+  /** Reusable dshmarket-style sameOrigin check (from dshmarket@1.65.1). */
+  function dshmarketSameOrigin(req) {
+    const host = req.headers?.host
+    const origin = req.headers?.origin
+    const isLoopback = host === '127.0.0.1:3080'
+      || host === 'localhost:3080'
+      || host?.startsWith('127.0.0.1')
+      || host?.startsWith('localhost')
+    if (!isLoopback) return false
+    if (!origin) return true
+    return origin === `http://${host}`
+  }
+
+  it('dshmarket discovery route: valid proxy request is normalized to loopback and passes sameOrigin', async () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+
+    let handlerCalls = 0
+    ctx.webServer.register({
+      path: '/dsh-market/discovery-compatibility',
+      method: 'POST',
+      async handler(req, res) {
+        handlerCalls += 1
+        if (!dshmarketSameOrigin(req)) {
+          res.writeHead(403, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'forbidden' }))
+          return
+        }
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ compatible: true }))
+      },
+    })
+
+    const req = {
+      method: 'POST',
+      url: '/dsh-market/discovery-compatibility',
+      headers: {
+        host: 'dsh.test.example',
+        origin: 'https://dsh.test.example',
+        [HEADER_NAME]: SECRET,
+      },
+    }
+    const res = fakeResponse()
+    await ctx.webServer.handle(req, res)
+
+    assert.equal(handlerCalls, 1)
+    assert.equal(res.status, 200)
+    assert.deepEqual(JSON.parse(res.body), { compatible: true })
+    assert.equal(req.headers.host, '127.0.0.1:3080')
+    assert.equal(req.headers.origin, 'http://127.0.0.1:3080')
+    assert.equal(req.headers['x-forwarded-host'], 'dsh.test.example')
+    assert.equal(req.headers['x-forwarded-proto'], 'https')
+    ctx.dispose()
+  })
+
+  it('dshmarket update mutation route: valid proxy request succeeds', async () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+
+    let installedPlugin = null
+    ctx.webServer.register({
+      path: '/dsh-market/update',
+      method: 'POST',
+      async handler(req, res) {
+        if (!dshmarketSameOrigin(req)) {
+          res.writeHead(403).end('forbidden')
+          return
+        }
+        installedPlugin = 'dsh-plugin-sample'
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ status: 'updated' }))
+      },
+    })
+
+    const req = {
+      method: 'POST',
+      url: '/dsh-market/update',
+      headers: {
+        host: 'dsh.test.example',
+        origin: 'https://dsh.test.example',
+        [HEADER_NAME]: SECRET,
+      },
+    }
+    const res = fakeResponse()
+    await ctx.webServer.handle(req, res)
+
+    assert.equal(res.status, 200)
+    assert.equal(installedPlugin, 'dsh-plugin-sample')
+    ctx.dispose()
+  })
+
+  it('dshmarket route: cross-origin CSRF attack is rejected with 403 before normalization or handler call', async () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+
+    let handlerCalls = 0
+    ctx.webServer.register({
+      path: '/dsh-market/discovery-compatibility',
+      method: 'POST',
+      async handler(req, res) {
+        handlerCalls += 1
+        res.writeHead(200).end('ok')
+      },
+    })
+
+    const req = {
+      method: 'POST',
+      url: '/dsh-market/discovery-compatibility',
+      headers: {
+        host: 'dsh.test.example',
+        origin: 'https://evil-attacker.example',
+        [HEADER_NAME]: SECRET,
+      },
+    }
+    const res = fakeResponse()
+    await ctx.webServer.handle(req, res)
+
+    assert.equal(handlerCalls, 0, 'third-party handler must never be called on CSRF')
+    assert.equal(res.status, 403)
+    assert.equal(res.headers['cache-control'], 'no-store')
+    assert.equal(res.body, 'forbidden')
+    // Crucial: headers were not normalized for the attacker
+    assert.equal(req.headers.host, 'dsh.test.example')
+    assert.equal(req.headers.origin, 'https://evil-attacker.example')
+    ctx.dispose()
+  })
+
+  it('dshmarket route: cross-site fetch metadata is rejected with 403 before handler call', async () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+
+    let handlerCalls = 0
+    ctx.webServer.register({
+      path: '/dsh-market/discovery-compatibility',
+      method: 'POST',
+      async handler(req, res) {
+        handlerCalls += 1
+        res.writeHead(200).end('ok')
+      },
+    })
+
+    const req = {
+      method: 'POST',
+      url: '/dsh-market/discovery-compatibility',
+      headers: {
+        host: 'dsh.test.example',
+        origin: 'https://dsh.test.example',
+        'sec-fetch-site': 'cross-site',
+        [HEADER_NAME]: SECRET,
+      },
+    }
+    const res = fakeResponse()
+    await ctx.webServer.handle(req, res)
+
+    assert.equal(handlerCalls, 0)
+    assert.equal(res.status, 403)
+    ctx.dispose()
+  })
+
+  it('dshmarket route: untrusted Host is rejected with 403 before handler call', async () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+
+    let handlerCalls = 0
+    ctx.webServer.register({
+      path: '/dsh-market/discovery-compatibility',
+      method: 'POST',
+      async handler(req, res) {
+        handlerCalls += 1
+        res.writeHead(200).end('ok')
+      },
+    })
+
+    const req = {
+      method: 'POST',
+      url: '/dsh-market/discovery-compatibility',
+      headers: {
+        host: 'evil-host.invalid',
+        [HEADER_NAME]: SECRET,
+      },
+    }
+    const res = fakeResponse()
+    await ctx.webServer.handle(req, res)
+
+    assert.equal(handlerCalls, 0)
+    assert.equal(res.status, 403)
+    ctx.dispose()
+  })
+
+  it('dshmarket route: request without proxy secret is not normalized and fails plugin loopback check', async () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+
+    let handlerCalls = 0
+    ctx.webServer.register({
+      path: '/dsh-market/discovery-compatibility',
+      method: 'POST',
+      async handler(req, res) {
+        handlerCalls += 1
+        if (!dshmarketSameOrigin(req)) {
+          res.writeHead(403).end('forbidden by plugin')
+          return
+        }
+        res.writeHead(200).end('ok')
+      },
+    })
+
+    const req = {
+      method: 'POST',
+      url: '/dsh-market/discovery-compatibility',
+      headers: {
+        host: 'dsh.test.example',
+        origin: 'https://dsh.test.example',
+        // No proxy secret header
+      },
+    }
+    const res = fakeResponse()
+    await ctx.webServer.handle(req, res)
+
+    assert.equal(handlerCalls, 1)
+    assert.equal(res.status, 403)
+    assert.equal(res.body, 'forbidden by plugin')
+    assert.equal(req.headers.host, 'dsh.test.example')
+    ctx.dispose()
+  })
+
+  it('dshmarket route: direct loopback request without proxy secret passes plugin check', async () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+
+    ctx.webServer.register({
+      path: '/dsh-market/discovery-compatibility',
+      method: 'POST',
+      async handler(req, res) {
+        if (!dshmarketSameOrigin(req)) {
+          res.writeHead(403).end('forbidden')
+          return
+        }
+        res.writeHead(200).end('loopback ok')
+      },
+    })
+
+    const req = {
+      method: 'POST',
+      url: '/dsh-market/discovery-compatibility',
+      headers: {
+        host: '127.0.0.1:3080',
+        origin: 'http://127.0.0.1:3080',
+      },
+    }
+    const res = fakeResponse()
+    await ctx.webServer.handle(req, res)
+
+    assert.equal(res.status, 200)
+    assert.equal(res.body, 'loopback ok')
+    ctx.dispose()
+  })
+
+  it('multiple third-party plugins registering diverse routes all work transparently', async () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+
+    // Plugin 1: analytics plugin (GET exact route)
+    ctx.webServer.register({
+      path: '/plugins/analytics/stats',
+      method: 'GET',
+      async handler(req, res) {
+        const isLoopback = req.headers.host?.startsWith('127.0.0.1')
+        if (!isLoopback) return res.writeHead(403).end('non-loopback')
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ activeUsers: 42 }))
+      },
+    })
+
+    // Plugin 2: file manager plugin (POST mutation route)
+    ctx.webServer.register({
+      path: '/plugins/files/upload',
+      method: 'POST',
+      async handler(req, res) {
+        if (!dshmarketSameOrigin(req)) return res.writeHead(403).end('cross-origin')
+        res.writeHead(201, { 'content-type': 'application/json' }).end(JSON.stringify({ uploaded: true }))
+      },
+    })
+
+    // Plugin 3: terminal proxy plugin (prefix route)
+    ctx.webServer.register({
+      prefix: '/plugins/term/',
+      method: 'GET',
+      async handler(req, res) {
+        const isLoopback = req.headers.host === '127.0.0.1:3080'
+        if (!isLoopback) return res.writeHead(403).end('remote forbidden')
+        res.writeHead(200).end(`terminal session for ${req.url}`)
+      },
+    })
+
+    // Issue request to Plugin 1
+    const req1 = {
+      method: 'GET',
+      url: '/plugins/analytics/stats',
+      headers: { host: 'dsh.test.example', [HEADER_NAME]: SECRET },
+    }
+    const res1 = fakeResponse()
+    await ctx.webServer.handle(req1, res1)
+    assert.equal(res1.status, 200)
+    assert.deepEqual(JSON.parse(res1.body), { activeUsers: 42 })
+
+    // Issue request to Plugin 2
+    const req2 = {
+      method: 'POST',
+      url: '/plugins/files/upload',
+      headers: {
+        host: 'dsh.test.example',
+        origin: 'https://dsh.test.example',
+        [HEADER_NAME]: SECRET,
+      },
+    }
+    const res2 = fakeResponse()
+    await ctx.webServer.handle(req2, res2)
+    assert.equal(res2.status, 201)
+    assert.deepEqual(JSON.parse(res2.body), { uploaded: true })
+
+    // Issue request to Plugin 3
+    const req3 = {
+      method: 'GET',
+      url: '/plugins/term/pty-session-123',
+      headers: { host: 'dsh.test.example', [HEADER_NAME]: SECRET },
+    }
+    const res3 = fakeResponse()
+    await ctx.webServer.handle(req3, res3)
+    assert.equal(res3.status, 200)
+    assert.equal(res3.body, 'terminal session for /plugins/term/pty-session-123')
+
+    ctx.dispose()
+  })
+
+  it('restores webServer.handle on cleanup so subsequent requests are not normalized', async () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+    const originalHandle = ctx.webServer.handle
+
+    ctx.webServer.register({
+      path: '/test/cleanup',
+      method: 'GET',
+      async handler(req, res) {
+        res.writeHead(200).end(req.headers.host)
+      },
+    })
+
+    // Before disposal: normalized to loopback
+    const reqBefore = {
+      method: 'GET',
+      url: '/test/cleanup',
+      headers: { host: 'dsh.test.example', [HEADER_NAME]: SECRET },
+    }
+    const resBefore = fakeResponse()
+    await ctx.webServer.handle(reqBefore, resBefore)
+    assert.equal(resBefore.body, '127.0.0.1:3080')
+
+    // Dispose
+    ctx.dispose()
+
+    // After disposal: handle restored, headers NOT normalized
+    const reqAfter = {
+      method: 'GET',
+      url: '/test/cleanup',
+      headers: { host: 'dsh.test.example', [HEADER_NAME]: SECRET },
+    }
+    const resAfter = fakeResponse()
+    await ctx.webServer.handle(reqAfter, resAfter)
+    assert.equal(resAfter.body, 'dsh.test.example')
+  })
+
+  it('rolls back connection decoration when webServer.handle cannot be decorated', () => {
+    process.env[SECRET_ENV] = SECRET
+    const connection = new FakeConnection()
+    const frozenWebServer = {
+      port: 3080,
+      taps: [],
+    }
+    Object.defineProperty(frozenWebServer, 'handle', {
+      value: async () => {},
+      writable: false,
+      configurable: false,
+    })
+
+    const ctx = fakeContext(connection, { webServer: frozenWebServer })
+    assert.throws(() => apply(ctx), /unsupported DSH webServer interface: handle could not be decorated/)
+
+    // Both connection methods were rolled back
+    assert.equal(Object.hasOwn(connection, 'requestRejection'), false)
+    assert.equal(Object.hasOwn(connection, 'authorizeIndex'), false)
+  })
+
+  it('normalizes to custom webServer.port (e.g. 3081)', async () => {
+    const connection = new FakeConnection()
+    const customWebServer = {
+      port: 3081,
+      taps: [],
+      routes: [],
+      tapIndex(fn) { return () => {} },
+      register(route) { this.routes.push(route) },
+      async handle(req, res) {
+        for (const route of this.routes) {
+          if (route.path === req.url) return await route.handler(req, res)
+        }
+      },
+    }
+    const ctx = activate(connection, SECRET, { webServer: customWebServer })
+
+    ctx.webServer.register({
+      path: '/dsh-market/check',
+      method: 'POST',
+      async handler(req, res) {
+        const expectedHost = '127.0.0.1:3081'
+        const expectedOrigin = 'http://127.0.0.1:3081'
+        if (req.headers.host !== expectedHost || req.headers.origin !== expectedOrigin) {
+          return res.writeHead(403).end('port mismatch')
+        }
+        res.writeHead(200).end('custom port ok')
+      },
+    })
+
+    const req = {
+      method: 'POST',
+      url: '/dsh-market/check',
+      headers: {
+        host: 'dsh.test.example',
+        origin: 'https://dsh.test.example',
+        [HEADER_NAME]: SECRET,
+      },
+    }
+    const res = fakeResponse()
+    await ctx.webServer.handle(req, res)
+    assert.equal(res.status, 200)
+    assert.equal(res.body, 'custom port ok')
+    ctx.dispose()
+  })
+
+  it('supports DELETE and PUT mutation routes from plugins', async () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+
+    ctx.webServer.register({
+      path: '/dsh-market/uninstall',
+      method: 'DELETE',
+      async handler(req, res) {
+        if (!dshmarketSameOrigin(req)) return res.writeHead(403).end('forbidden')
+        res.writeHead(204).end()
+      },
+    })
+
+    const req = {
+      method: 'DELETE',
+      url: '/dsh-market/uninstall',
+      headers: {
+        host: 'dsh.test.example',
+        origin: 'https://dsh.test.example',
+        [HEADER_NAME]: SECRET,
+      },
+    }
+    const res = fakeResponse()
+    await ctx.webServer.handle(req, res)
+    assert.equal(res.status, 204)
+    ctx.dispose()
+  })
+
+  it('handles routes with query parameters gracefully', async () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+
+    ctx.webServer.register({
+      prefix: '/dsh-market/search',
+      method: 'GET',
+      async handler(req, res) {
+        if (!dshmarketSameOrigin(req)) return res.writeHead(403).end('forbidden')
+        res.writeHead(200).end(`searched for ${req.url}`)
+      },
+    })
+
+    const req = {
+      method: 'GET',
+      url: '/dsh-market/search?q=syntax-theme&page=1',
+      headers: {
+        host: 'dsh.test.example',
+        [HEADER_NAME]: SECRET,
+      },
+    }
+    const res = fakeResponse()
+    await ctx.webServer.handle(req, res)
+    assert.equal(res.status, 200)
+    assert.equal(res.body, 'searched for /dsh-market/search?q=syntax-theme&page=1')
+    ctx.dispose()
+  })
+
+  it('bubbles downstream handler errors naturally', async () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+
+    ctx.webServer.register({
+      path: '/buggy/route',
+      method: 'GET',
+      async handler() {
+        throw new Error('plugin internal crash')
+      },
+    })
+
+    const req = {
+      method: 'GET',
+      url: '/buggy/route',
+      headers: {
+        host: 'dsh.test.example',
+        [HEADER_NAME]: SECRET,
+      },
+    }
+    await assert.rejects(
+      async () => { await ctx.webServer.handle(req, fakeResponse()) },
+      /plugin internal crash/,
+    )
+    ctx.dispose()
+  })
+
+  it('two overlapping activations unwrap webServer.handle instead of stacking', async () => {
+    const connection = new FakeConnection()
+    const sharedWebServer = {
+      port: 3080,
+      taps: [],
+      routes: [],
+      tapIndex(fn) { return () => {} },
+      register(route) { this.routes.push(route) },
+      async handle(req, res) {
+        for (const route of this.routes) {
+          if (route.path === req.url) return await route.handler(req, res)
+        }
+        res.writeHead(404).end('not found')
+      },
+    }
+    const ctx1 = activate(connection, SECRET, { webServer: sharedWebServer })
+    const ctx2 = activate(connection, SECRET, { webServer: sharedWebServer })
+
+    sharedWebServer.register({
+      path: '/overlapping/test',
+      method: 'GET',
+      async handler(req, res) {
+        res.writeHead(200).end(req.headers.host)
+      },
+    })
+
+    const req = {
+      method: 'GET',
+      url: '/overlapping/test',
+      headers: { host: 'dsh.test.example', [HEADER_NAME]: SECRET },
+    }
+    const res = fakeResponse()
+    await sharedWebServer.handle(req, res)
+    assert.equal(res.body, '127.0.0.1:3080')
+
+    ctx1.dispose()
+    ctx2.dispose()
+
+    // Pristine original handle is restored
+    assert.equal(Object.hasOwn(sharedWebServer, 'handle'), true)
+    assert.equal(sharedWebServer.handle[INNER], undefined, 'wrapper marker removed')
+  })
+})
+
