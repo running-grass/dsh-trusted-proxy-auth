@@ -246,6 +246,116 @@ function installWrapper(connection, captured, wrapper) {
 }
 
 /**
+ * Inline script tag injected into the index HTML when the request is verified
+ * by the trusted proxy.
+ *
+ * It explicitly sets `globalThis.__DSH_TRANSPORT__.ownsHost = true`, signalling
+ * to `@deepseek-ai/dsh-client-connection` that this session is host-privileged.
+ * This instructs `@deepseek-ai/dsh-client-ui-settings` to use `'host'`
+ * persistence instead of falling back to `'memory'`, unlocking the Models and
+ * Plugins configuration panels for reverse-proxy deployments.
+ */
+export const BOOTSTRAP_SCRIPT = '<script>globalThis.__DSH_TRANSPORT__=Object.assign(globalThis.__DSH_TRANSPORT__||{},{ownsHost:true});</script>'
+
+/**
+ * Inject the bootstrap script into an HTML string or Buffer.
+ *
+ * @param html - HTML string, Buffer, or other body representation.
+ * @returns the modified HTML in the original representation.
+ */
+export function injectBootstrapHtml(html) {
+  if (typeof html === 'string') {
+    if (/<head\b[^>]*>/i.test(html)) {
+      return html.replace(/(<head\b[^>]*>)/i, `$1${BOOTSTRAP_SCRIPT}`)
+    }
+    if (/<\/head>/i.test(html)) {
+      return html.replace(/(<\/head>)/i, `${BOOTSTRAP_SCRIPT}$1`)
+    }
+    return `${BOOTSTRAP_SCRIPT}${html}`
+  }
+  if (Buffer.isBuffer(html)) {
+    const text = html.toString('utf8')
+    const modified = injectBootstrapHtml(text)
+    return Buffer.from(modified, 'utf8')
+  }
+  return html
+}
+
+/**
+ * Decorate a response object to inject the bootstrap script when the index
+ * HTML payload is written.
+ *
+ * Strips or ignores stale Content-Length headers so chunked encoding transfers
+ * the augmented document cleanly without truncation.
+ *
+ * @param response - node:http ServerResponse or test stand-in.
+ */
+export function attachBootstrapInjection(response) {
+  if (response === null || typeof response !== 'object') return
+
+  let injected = false
+
+  const applyInjection = (chunk) => {
+    if (injected || chunk === undefined || chunk === null) return chunk
+    injected = true
+    if (typeof response.removeHeader === 'function') {
+      response.removeHeader('content-length')
+    }
+    return injectBootstrapHtml(chunk)
+  }
+
+  const originalSetHeader = response.setHeader
+  if (typeof originalSetHeader === 'function') {
+    response.setHeader = function setHeader(name, value) {
+      if (typeof name === 'string' && name.toLowerCase() === 'content-length') {
+        return this
+      }
+      return originalSetHeader.call(this, name, value)
+    }
+  }
+
+  const originalWriteHead = response.writeHead
+  if (typeof originalWriteHead === 'function') {
+    response.writeHead = function writeHead(statusCode, ...args) {
+      for (const arg of args) {
+        if (typeof arg === 'object' && arg !== null) {
+          for (const key of Object.keys(arg)) {
+            if (key.toLowerCase() === 'content-length') delete arg[key]
+          }
+        }
+      }
+      return originalWriteHead.call(this, statusCode, ...args)
+    }
+  }
+
+  const originalWrite = response.write
+  if (typeof originalWrite === 'function') {
+    response.write = function write(chunk, encoding, callback) {
+      const modified = applyInjection(chunk)
+      return originalWrite.call(this, modified, encoding, callback)
+    }
+  }
+
+  const originalEnd = response.end
+  if (typeof originalEnd === 'function') {
+    response.end = function end(chunk, encoding, callback) {
+      let data = chunk
+      let cb = callback
+      let enc = encoding
+      if (typeof data === 'function') {
+        cb = data
+        data = undefined
+      } else if (typeof enc === 'function') {
+        cb = enc
+        enc = undefined
+      }
+      const modified = data !== undefined ? applyInjection(data) : data
+      return originalEnd.call(this, modified, enc, cb)
+    }
+  }
+}
+
+/**
  * Answer the frontend index request with a deliberately minimal 403 body.
  *
  * @param response - the index response the caller would otherwise own.
@@ -370,7 +480,10 @@ export function apply(ctx) {
       if (!hasValidSecret(request)) return index.original.call(connection, request, response)
       // The proxy established identity; the Host/Origin fence still applies.
       const result = rejection.original.call(connection, request)
-      if (result === undefined || result === 401) return true
+      if (result === undefined || result === 401) {
+        attachBootstrapInjection(response)
+        return true
+      }
       writeForbidden(response)
       return false
     }))

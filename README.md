@@ -42,10 +42,13 @@ SSH tunnel / direct access
 
 - Tested against **DSH 0.1.5-rc.2** on **Node v24.21.0** (Node 20 and 22 are
   covered by CI).
-- 50 unit tests and 35 live-DSH integration checks pass. See
+- 60 unit tests and 37 live-DSH integration checks pass. See
   [`docs/VALIDATION.md`](docs/VALIDATION.md).
 - A startup invariant re-proves DSH's `403`/`401` semantics on every boot, so a
   semantics change cannot silently turn the plugin into a bypass.
+- Injects a server-verified `__DSH_TRANSPORT__.ownsHost = true` bootstrap into
+  the index HTML for proxy-authenticated requests, enabling full host settings
+  persistence (Models catalog, Plugins configuration) across remote origins.
 - No runtime dependencies — only `node:crypto`.
 - No build step; plain ESM.
 
@@ -74,7 +77,7 @@ Install the plugin bundle into the Web profile and restart:
 dsh plugin --profile web add /path/to/dsh-trusted-proxy-auth
 
 # or directly from this repository, pinned to the released tag
-dsh plugin --profile web add git+https://github.com/lukepoo101/dsh-trusted-proxy-auth.git#v0.1.0
+dsh plugin --profile web add git+https://github.com/lukepoo101/dsh-trusted-proxy-auth.git#v0.2.0
 
 # an exact commit is equally acceptable for an authentication-boundary plugin
 dsh plugin --profile web add git+https://github.com/lukepoo101/dsh-trusted-proxy-auth.git#<40-char-commit>
@@ -140,11 +143,37 @@ guarantee unambiguous.
 | --- | --- | --- |
 | missing/wrong | — | delegated to the original native flow |
 | valid | `403` | `403 forbidden`, response ended |
-| valid | `401` or `undefined` | index served |
+| valid | `401` or `undefined` | index served with `ownsHost: true` bootstrap injection |
 
 The plugin is **never** allowed to turn an upstream `403` into success, so
 DNS-rebinding and cross-site protections keep working even with a correct
 secret.
+
+### Settings persistence & `ownsHost` bootstrap
+
+DSH's client-side settings service resolves persistence strategy via:
+
+```javascript
+persistence = ctx.remote.$host.isLoopback ? 'host' : 'memory'
+```
+
+When accessed over a reverse proxy (e.g. `https://dsh.example.com`),
+`window.location.hostname` is non-loopback, causing DSH to switch to in-memory
+persistence mode, leaving Models and Plugins empty with *"settings are unavailable
+in this browser"*.
+
+To resolve this safely without trusting arbitrary client hostnames,
+`dsh-trusted-proxy-auth` intercepts successful proxy-authenticated `authorizeIndex`
+responses and injects:
+
+```html
+<script>globalThis.__DSH_TRANSPORT__=Object.assign(globalThis.__DSH_TRANSPORT__||{},{ownsHost:true});</script>
+```
+
+into `<head>`. DSH's connection package evaluates `transport?.ownsHost === true`,
+setting `isLoopback = true` and activating `'host'` persistence for the proxy-authenticated
+operator session. Direct loopback/SSH access without the proxy header does not receive the
+injection and relies on native loopback identification.
 
 ## Reverse-proxy contract
 

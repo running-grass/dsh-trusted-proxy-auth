@@ -254,6 +254,10 @@ try {
   const validHeader = await request({ port, path: '/', headers: { ...trusted, ...proxy } })
   check('valid proxy header -> 200', validHeader.status === 200, `got ${validHeader.status}`)
   check('valid proxy header serves the HTML application', /<!doctype html>/i.test(validHeader.body))
+  check(
+    'valid proxy header injects ownsHost bootstrap into index HTML',
+    validHeader.body.includes('__DSH_TRANSPORT__') && validHeader.body.includes('ownsHost:true'),
+  )
 
   const evilHost = await request({ port, path: '/', headers: { host: EVIL_HOST, ...proxy } })
   check('valid proxy header + untrusted Host -> 403', evilHost.status === 403, `got ${evilHost.status}`)
@@ -328,6 +332,7 @@ try {
 
   const nativeIndex = await request({ port, path: '/', headers: { host: authority }, cookie: sessionCookie })
   check('native session cookie -> 200', nativeIndex.status === 200, `got ${nativeIndex.status}`)
+  check('native session cookie does not inject proxy ownsHost bootstrap', !nativeIndex.body.includes('ownsHost:true'))
 
   const badToken = await request({ port, path: '/?token=definitely-not-valid', headers: { host: authority } })
   check('invalid native token -> 401', badToken.status === 401, `got ${badToken.status}`)

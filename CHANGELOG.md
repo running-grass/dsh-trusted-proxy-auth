@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-09-25
+
+### Added
+
+- Proxy-authenticated browser bootstrap injection: when `authorizeIndex` verifies
+  a request carrying a valid `X-DSH-Proxy-Auth` secret, it attaches a response
+  decorator that injects `globalThis.__DSH_TRANSPORT__.ownsHost = true` into the
+  served `index.html`.
+- Enables DSH host persistence (`ctx.remote.$host.isLoopback === true` ->
+  `persistence = "host"`) for reverse-proxied domains (such as
+  `dsh.terraurbs.com`), fixing the issue where the Models directory, Plugin
+  settings, and Provider configuration appeared empty or reported "settings are
+  unavailable in this browser".
+- Server-verified: the bootstrap script is only injected when the reverse proxy
+  has supplied the correct shared secret. Unauthenticated or native loopback
+  access receives standard unmodified HTML.
+- Safe HTTP streaming handling: strips or suppresses stale `Content-Length`
+  response headers so chunked encoding transfers the injected document cleanly
+  without truncation.
+- Unit tests covering bootstrap injection, HTML insertion rules (in `<head>`,
+  before `</head>`, or prepended), and `Content-Length` removal.
+
 ## [0.1.0] - 2026-09-20
 
 ### Added

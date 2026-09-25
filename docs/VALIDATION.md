@@ -14,29 +14,31 @@ They are recorded here as evidence; re-run the commands to reproduce.
 | DSH install files modified | none (`find … -newermt` returned no files) |
 | Production profile touched | no (the running server and its profile were left untouched) |
 
-## Unit tests — 50 passed, 0 failed
+## Unit tests — 60 passed, 0 failed
 
 ```console
 $ npm test
-ℹ tests 50
-ℹ suites 6
-ℹ pass 50
+ℹ tests 60
+ℹ suites 7
+ℹ pass 60
 ℹ fail 0
 ```
 
 Coverage: `requestRejection` result mapping (including pass-through of an
-unexpected upstream status); `authorizeIndex` decision tree; header parsing
-(exact, off-by-one, empty, missing, absent headers, array, non-string,
-duplicate, joined, `Headers` case-insensitivity); configuration failures
-(missing/empty/short/comma/whitespace/non-ASCII secret, missing `ctx.effect`,
-missing service, missing methods, non-extensible service, undecoratable method
-with rollback, a mutation that landed but failed verification, and rollback when
-`ctx.effect` fails); the startup semantic invariant; lifecycle (install,
-exact-shape restore for inherited and own methods, apply→cleanup→apply,
-overlapping activations, cross-generation global-marker unwrap, `authenticatedUrl`
-untouched, no secret in logs).
+unexpected upstream status); `authorizeIndex` decision tree; proxy bootstrap
+HTML injection (`__DSH_TRANSPORT__.ownsHost = true` script insertion in `<head>`,
+`</head>`, or fragment; Buffer and chunked handling; `Content-Length` removal);
+header parsing (exact, off-by-one, empty, missing, absent headers, array,
+non-string, duplicate, joined, `Headers` case-insensitivity); configuration
+failures (missing/empty/short/comma/whitespace/non-ASCII secret, missing
+`ctx.effect`, missing service, missing methods, non-extensible service,
+undecoratable method with rollback, a mutation that landed but failed
+verification, and rollback when `ctx.effect` fails); the startup semantic
+invariant; lifecycle (install, exact-shape restore for inherited and own
+methods, apply→cleanup→apply, overlapping activations, cross-generation
+global-marker unwrap, `authenticatedUrl` untouched, no secret in logs).
 
-## Integration tests — 35 passed, 0 failed
+## Integration tests — 37 passed, 0 failed
 
 `npm run test:integration` boots the real Harness Web server with this plugin
 loaded next to `@deepseek-ai/dsh-client-connection` and asserts:
@@ -52,6 +54,7 @@ loaded next to `@deepseek-ai/dsh-client-connection` and asserts:
   ok    wrong proxy header -> 401
   ok    valid proxy header -> 200
   ok    valid proxy header serves the HTML application
+  ok    valid proxy header injects ownsHost bootstrap into index HTML
   ok    valid proxy header + untrusted Host -> 403
   ok    untrusted Host 403 body is minimal
   ok    untrusted Host 403 sets no-store
@@ -76,6 +79,7 @@ loaded next to `@deepseek-ai/dsh-client-connection` and asserts:
   ok    native ?token= exchange -> 303
   ok    native token exchange mints a session cookie
   ok    native session cookie -> 200
+  ok    native session cookie does not inject proxy ownsHost bootstrap
   ok    invalid native token -> 401
   ok    native cookie is authority-bound (evil Host -> 401)
 
@@ -93,7 +97,7 @@ loaded next to `@deepseek-ai/dsh-client-connection` and asserts:
 == filesystem hygiene ==
   ok    secret never written under DSH_HOME
 
-PASS: 35 passed, 0 failed
+PASS: 37 passed, 0 failed
 ```
 
 ## Startup semantic invariant

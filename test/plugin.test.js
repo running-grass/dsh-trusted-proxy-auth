@@ -10,7 +10,15 @@
 import assert from 'node:assert/strict'
 import { afterEach, describe, it } from 'node:test'
 
-import { HEADER_NAME, MIN_SECRET_BYTES, SECRET_ENV, apply } from '../index.js'
+import {
+  BOOTSTRAP_SCRIPT,
+  HEADER_NAME,
+  MIN_SECRET_BYTES,
+  SECRET_ENV,
+  apply,
+  attachBootstrapInjection,
+  injectBootstrapHtml,
+} from '../index.js'
 
 /** A known-good secret of exactly 48 bytes. */
 const SECRET = 'unit-test-secret-'.padEnd(48, '0')
@@ -58,6 +66,7 @@ function fakeContext(connection) {
 
 /** Minimal node:http ServerResponse stand-in. */
 function fakeResponse() {
+  const headersMap = new Map()
   return {
     status: undefined,
     headers: undefined,
@@ -68,8 +77,29 @@ function fakeResponse() {
       this.headers = headers
       return this
     },
+    setHeader(name, value) {
+      headersMap.set(String(name).toLowerCase(), value)
+      return this
+    },
+    getHeader(name) {
+      return headersMap.get(String(name).toLowerCase())
+    },
+    hasHeader(name) {
+      return headersMap.has(String(name).toLowerCase())
+    },
+    removeHeader(name) {
+      headersMap.delete(String(name).toLowerCase())
+    },
+    write(chunk) {
+      const str = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
+      this.body = (this.body ?? '') + str
+      return true
+    },
     end(body) {
-      this.body = body
+      if (body !== undefined) {
+        const str = Buffer.isBuffer(body) ? body.toString('utf8') : String(body)
+        this.body = (this.body ?? '') + str
+      }
       this.ended = true
       return this
     },
@@ -300,6 +330,109 @@ describe('authorizeIndex', () => {
     assert.equal(connection.authorizeIndex({ headers: { host: LOOPBACK_HOST, [HEADER_NAME]: 'nope' } }, response), false)
     assert.equal(connection.indexCalls, 1)
     assert.equal(response.status, 401)
+  })
+
+  it('valid secret attaches bootstrap injection which inserts script into index HTML', () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+    const response = fakeResponse()
+    assert.equal(
+      connection.authorizeIndex({ headers: { host: LOOPBACK_HOST, [HEADER_NAME]: SECRET } }, response),
+      true,
+    )
+    assert.equal(response.ended, false)
+    response.end('<!doctype html><html><head><meta charset="utf-8"></head><body><h1>DSH</h1></body></html>')
+    assert.equal(response.ended, true)
+    assert.ok(response.body.includes(BOOTSTRAP_SCRIPT))
+    assert.ok(response.body.includes('<head>' + BOOTSTRAP_SCRIPT))
+    assert.ok(response.body.includes('ownsHost:true'))
+    ctx.dispose()
+  })
+
+  it('valid secret handles Buffer payload in response.end', () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+    const response = fakeResponse()
+    connection.authorizeIndex({ headers: { host: LOOPBACK_HOST, [HEADER_NAME]: SECRET } }, response)
+    response.end(Buffer.from('<html><head></head><body></body></html>', 'utf8'))
+    assert.ok(response.body.includes(BOOTSTRAP_SCRIPT))
+    ctx.dispose()
+  })
+
+  it('valid secret handles response.write then response.end', () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+    const response = fakeResponse()
+    connection.authorizeIndex({ headers: { host: LOOPBACK_HOST, [HEADER_NAME]: SECRET } }, response)
+    response.write('<html><head><title>Test</title></head>')
+    response.end('<body>App</body></html>')
+    assert.ok(response.body.includes(BOOTSTRAP_SCRIPT))
+    assert.ok(response.body.includes('App'))
+    ctx.dispose()
+  })
+
+  it('valid secret strips stale Content-Length header', () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+    const response = fakeResponse()
+    connection.authorizeIndex({ headers: { host: LOOPBACK_HOST, [HEADER_NAME]: SECRET } }, response)
+    response.setHeader('content-length', 42)
+    response.end('<html><head></head><body></body></html>')
+    assert.equal(response.hasHeader('content-length'), false)
+    ctx.dispose()
+  })
+
+  it('missing secret does not inject bootstrap script', () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+    const response = fakeResponse()
+    assert.equal(connection.authorizeIndex({ headers: { host: LOOPBACK_HOST } }, response), false)
+    assert.equal(response.status, 401)
+    assert.equal(response.body, 'unauthorized')
+    assert.ok(!response.body.includes('ownsHost'))
+    ctx.dispose()
+  })
+})
+
+describe('bootstrap HTML injection', () => {
+  it('injects script immediately after <head>', () => {
+    const html = '<!DOCTYPE html><html><head><meta charset="utf-8"></head><body></body></html>'
+    const result = injectBootstrapHtml(html)
+    assert.equal(
+      result,
+      '<!DOCTYPE html><html><head>' + BOOTSTRAP_SCRIPT + '<meta charset="utf-8"></head><body></body></html>',
+    )
+  })
+
+  it('injects script immediately after <head> with attributes', () => {
+    const html = '<html><head lang="en"><title>DSH</title></head></html>'
+    const result = injectBootstrapHtml(html)
+    assert.equal(
+      result,
+      '<html><head lang="en">' + BOOTSTRAP_SCRIPT + '<title>DSH</title></head></html>',
+    )
+  })
+
+  it('injects script before </head> when opening head is absent', () => {
+    const html = '<html><title>No Open</title></head><body></body></html>'
+    const result = injectBootstrapHtml(html)
+    assert.equal(
+      result,
+      '<html><title>No Open</title>' + BOOTSTRAP_SCRIPT + '</head><body></body></html>',
+    )
+  })
+
+  it('prepends script when head tags are completely absent', () => {
+    const html = '<div>Bare Fragment</div>'
+    const result = injectBootstrapHtml(html)
+    assert.equal(result, BOOTSTRAP_SCRIPT + '<div>Bare Fragment</div>')
+  })
+
+  it('handles Buffer input correctly', () => {
+    const buf = Buffer.from('<html><head></head><body></body></html>', 'utf8')
+    const result = injectBootstrapHtml(buf)
+    assert.ok(Buffer.isBuffer(result))
+    assert.ok(result.toString('utf8').includes(BOOTSTRAP_SCRIPT))
   })
 })
 
