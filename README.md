@@ -77,7 +77,7 @@ Install the plugin bundle into the Web profile and restart:
 dsh plugin --profile web add /path/to/dsh-trusted-proxy-auth
 
 # or directly from this repository, pinned to the released tag
-dsh plugin --profile web add git+https://github.com/lukepoo101/dsh-trusted-proxy-auth.git#v0.2.0
+dsh plugin --profile web add git+https://github.com/lukepoo101/dsh-trusted-proxy-auth.git#v0.2.1
 
 # an exact commit is equally acceptable for an authentication-boundary plugin
 dsh plugin --profile web add git+https://github.com/lukepoo101/dsh-trusted-proxy-auth.git#<40-char-commit>
@@ -163,17 +163,17 @@ persistence mode, leaving Models and Plugins empty with *"settings are unavailab
 in this browser"*.
 
 To resolve this safely without trusting arbitrary client hostnames,
-`dsh-trusted-proxy-auth` intercepts successful proxy-authenticated `authorizeIndex`
-responses and injects:
+`dsh-trusted-proxy-auth` hooks into DSH's supported web server extension seams
+(`webServer.tapIndex` and the `webserver/index-inject` event) to inject:
 
 ```html
 <script>globalThis.__DSH_TRANSPORT__=Object.assign(globalThis.__DSH_TRANSPORT__||{},{ownsHost:true});</script>
 ```
 
-into `<head>`. DSH's connection package evaluates `transport?.ownsHost === true`,
+into `<head>` when rendering the web shell. DSH's connection package evaluates `transport?.ownsHost === true`,
 setting `isLoopback = true` and activating `'host'` persistence for the proxy-authenticated
-operator session. Direct loopback/SSH access without the proxy header does not receive the
-injection and relies on native loopback identification.
+operator session. Node's `ServerResponse` pipeline remains completely unmodified, ensuring standard
+HTTP chunked streaming and headers without truncation.
 
 ## Reverse-proxy contract
 

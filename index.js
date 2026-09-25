@@ -247,6 +247,8 @@ function installWrapper(connection, captured, wrapper) {
 
 /**
  * Inline script tag injected into the index HTML when the request is verified
+/**
+ * Inline script tag injected into the index HTML when the request is verified
  * by the trusted proxy.
  *
  * It explicitly sets `globalThis.__DSH_TRANSPORT__.ownsHost = true`, signalling
@@ -260,11 +262,17 @@ export const BOOTSTRAP_SCRIPT = '<script>globalThis.__DSH_TRANSPORT__=Object.ass
 /**
  * Inject the bootstrap script into an HTML string or Buffer.
  *
+ * Idempotent: if the document already defines __DSH_TRANSPORT__ with ownsHost,
+ * the input is returned unmodified.
+ *
  * @param html - HTML string, Buffer, or other body representation.
  * @returns the modified HTML in the original representation.
  */
 export function injectBootstrapHtml(html) {
   if (typeof html === 'string') {
+    if (html.includes('__DSH_TRANSPORT__') && html.includes('ownsHost')) {
+      return html
+    }
     if (/<head\b[^>]*>/i.test(html)) {
       return html.replace(/(<head\b[^>]*>)/i, `$1${BOOTSTRAP_SCRIPT}`)
     }
@@ -282,77 +290,38 @@ export function injectBootstrapHtml(html) {
 }
 
 /**
- * Decorate a response object to inject the bootstrap script when the index
- * HTML payload is written.
+ * Safely resolve the webServer service from the Cordis context if available.
  *
- * Strips or ignores stale Content-Length headers so chunked encoding transfers
- * the augmented document cleanly without truncation.
+ * @param ctx - Cordis context.
+ * @returns the webServer service or undefined.
+ */
+export function resolveWebServer(ctx) {
+  try {
+    if (ctx?.webServer && typeof ctx.webServer === 'object') return ctx.webServer
+  } catch {
+    // Context proxy might throw if not declared in inject
+  }
+  try {
+    if (typeof ctx?.get === 'function') {
+      const found = ctx.get('webServer')
+      if (found && typeof found === 'object') return found
+    }
+  } catch {
+    // Ignore
+  }
+  return undefined
+}
+
+/**
+ * No-op retained for backwards compatibility.
  *
- * @param response - node:http ServerResponse or test stand-in.
+ * Bootstrap injection is handled via webServer.tapIndex and webserver/index-inject
+ * rather than mutating Node's ServerResponse.
+ *
+ * @deprecated
  */
 export function attachBootstrapInjection(response) {
-  if (response === null || typeof response !== 'object') return
-
-  let injected = false
-
-  const applyInjection = (chunk) => {
-    if (injected || chunk === undefined || chunk === null) return chunk
-    injected = true
-    if (typeof response.removeHeader === 'function') {
-      response.removeHeader('content-length')
-    }
-    return injectBootstrapHtml(chunk)
-  }
-
-  const originalSetHeader = response.setHeader
-  if (typeof originalSetHeader === 'function') {
-    response.setHeader = function setHeader(name, value) {
-      if (typeof name === 'string' && name.toLowerCase() === 'content-length') {
-        return this
-      }
-      return originalSetHeader.call(this, name, value)
-    }
-  }
-
-  const originalWriteHead = response.writeHead
-  if (typeof originalWriteHead === 'function') {
-    response.writeHead = function writeHead(statusCode, ...args) {
-      for (const arg of args) {
-        if (typeof arg === 'object' && arg !== null) {
-          for (const key of Object.keys(arg)) {
-            if (key.toLowerCase() === 'content-length') delete arg[key]
-          }
-        }
-      }
-      return originalWriteHead.call(this, statusCode, ...args)
-    }
-  }
-
-  const originalWrite = response.write
-  if (typeof originalWrite === 'function') {
-    response.write = function write(chunk, encoding, callback) {
-      const modified = applyInjection(chunk)
-      return originalWrite.call(this, modified, encoding, callback)
-    }
-  }
-
-  const originalEnd = response.end
-  if (typeof originalEnd === 'function') {
-    response.end = function end(chunk, encoding, callback) {
-      let data = chunk
-      let cb = callback
-      let enc = encoding
-      if (typeof data === 'function') {
-        cb = data
-        data = undefined
-      } else if (typeof enc === 'function') {
-        cb = enc
-        enc = undefined
-      }
-      const modified = data !== undefined ? applyInjection(data) : data
-      return originalEnd.call(this, modified, enc, cb)
-    }
-  }
+  // Deliberately no-op to preserve DSH's native HTTP response pipeline.
 }
 
 /**
@@ -480,17 +449,40 @@ export function apply(ctx) {
       if (!hasValidSecret(request)) return index.original.call(connection, request, response)
       // The proxy established identity; the Host/Origin fence still applies.
       const result = rejection.original.call(connection, request)
-      if (result === undefined || result === 401) {
-        attachBootstrapInjection(response)
-        return true
-      }
+      if (result === undefined || result === 401) return true
       writeForbidden(response)
       return false
     }))
 
+    // Register bootstrap injection via supported DSH webServer seams:
+    // 1. webServer.tapIndex (raw HTML transform on index responses)
+    const webServer = resolveWebServer(ctx)
+    if (webServer && typeof webServer.tapIndex === 'function') {
+      const unregisterTap = webServer.tapIndex((html) => injectBootstrapHtml(html))
+      if (typeof unregisterTap === 'function') {
+        restores.push(unregisterTap)
+      }
+    }
+
+    // 2. webserver/index-inject event (structured injection table)
+    if (typeof ctx.on === 'function') {
+      const unregisterEvent = ctx.on('webserver/index-inject', (table) => {
+        if (Array.isArray(table)) {
+          table.push({
+            kind: 'global',
+            name: '__DSH_TRANSPORT__',
+            value: { ownsHost: true },
+          })
+        }
+      })
+      if (typeof unregisterEvent === 'function') {
+        restores.push(unregisterEvent)
+      }
+    }
+
     ctx.effect(() => () => {
       for (const restore of [...restores].reverse()) restore()
-    }, `${LOG_PREFIX}: connection decoration`)
+    }, `${LOG_PREFIX}: connection and webserver decoration`)
   } catch (error) {
     // Roll back everything installed in this activation, including the case
     // where ctx.effect failed to register the disposer.

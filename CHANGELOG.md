@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-09-25
+
+### Fixed
+
+- Eliminated 502 Bad Gateway / empty HTTP reply on authenticated index requests:
+  reverted `ServerResponse.writeHead`, `write`, and `end` monkey-patching in
+  `authorizeIndex`. Response streaming and headers are now left entirely to DSH's
+  native HTTP pipeline.
+- Migrated `ownsHost` bootstrap injection to DSH's supported extension seams:
+  - `webServer.tapIndex`: registers a pure HTML transform applied by DSH's
+    `renderIndex` pipeline.
+  - `webserver/index-inject`: listens for the structured injection event and pushes
+    `{ kind: 'global', name: '__DSH_TRANSPORT__', value: { ownsHost: true } }`.
+- Made HTML injection idempotent so that `tapIndex` skips injection if structured
+  `__DSH_TRANSPORT__` injection is already present in the rendered document.
+- Unit tests updated to verify native response preservation and extension seam
+  registration (62 unit tests pass).
+
 ## [0.2.0] - 2026-09-25
 
 ### Added

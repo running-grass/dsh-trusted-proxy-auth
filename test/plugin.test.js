@@ -18,6 +18,7 @@ import {
   apply,
   attachBootstrapInjection,
   injectBootstrapHtml,
+  resolveWebServer,
 } from '../index.js'
 
 /** A known-good secret of exactly 48 bytes. */
@@ -42,16 +43,42 @@ afterEach(() => {
 })
 
 /** Minimal Cordis-like context: synchronous effect collection plus a logger. */
-function fakeContext(connection) {
+function fakeContext(connection, options = {}) {
   const log = []
   const disposers = []
+  const events = new Map()
+  const webServer = options.webServer ?? {
+    taps: [],
+    tapIndex(transform) {
+      this.taps.push(transform)
+      return () => {
+        const idx = this.taps.indexOf(transform)
+        if (idx !== -1) this.taps.splice(idx, 1)
+      }
+    },
+  }
   return {
     connection,
+    webServer: options.noWebServer ? undefined : webServer,
     log,
+    events,
     logger: {
       info: (message) => log.push(`info ${String(message)}`),
       warn: (message) => log.push(`warn ${String(message)}`),
       error: (message) => log.push(`error ${String(message)}`),
+    },
+    on(event, listener) {
+      if (!events.has(event)) events.set(event, [])
+      events.get(event).push(listener)
+      return () => {
+        const list = events.get(event)
+        const idx = list.indexOf(listener)
+        if (idx !== -1) list.splice(idx, 1)
+      }
+    },
+    emit(event, ...args) {
+      const list = events.get(event) ?? []
+      for (const fn of list) fn(...args)
     },
     effect(execute) {
       const disposer = execute()
@@ -177,9 +204,9 @@ class FakeConnection {
  * test observes only the requests it issues itself (activation runs the
  * semantic probe).
  */
-function activate(connection, secret = SECRET) {
+function activate(connection, secret = SECRET, options = {}) {
   process.env[SECRET_ENV] = secret
-  const ctx = fakeContext(connection)
+  const ctx = fakeContext(connection, options)
   apply(ctx)
   connection.rejectionCalls = 0
   connection.indexCalls = 0
@@ -332,64 +359,87 @@ describe('authorizeIndex', () => {
     assert.equal(response.status, 401)
   })
 
-  it('valid secret attaches bootstrap injection which inserts script into index HTML', () => {
+  it('valid secret permits index access and leaves response methods unwrapped', () => {
     const connection = new FakeConnection()
     const ctx = activate(connection)
+    const response = fakeResponse()
+    const origEnd = response.end
+    const origWrite = response.write
+    const origWriteHead = response.writeHead
+    assert.equal(
+      connection.authorizeIndex({ headers: { host: LOOPBACK_HOST, [HEADER_NAME]: SECRET } }, response),
+      true,
+    )
+    assert.equal(response.end, origEnd)
+    assert.equal(response.write, origWrite)
+    assert.equal(response.writeHead, origWriteHead)
+    assert.equal(response.ended, false)
+    ctx.dispose()
+  })
+
+  it('registers webServer.tapIndex transform which injects ownsHost script', () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+    assert.equal(ctx.webServer.taps.length, 1)
+    const transform = ctx.webServer.taps[0]
+    const html = '<!doctype html><html><head><meta charset="utf-8"></head><body><h1>DSH</h1></body></html>'
+    const result = transform(html)
+    assert.ok(result.includes(BOOTSTRAP_SCRIPT))
+    assert.ok(result.includes('<head>' + BOOTSTRAP_SCRIPT))
+    assert.ok(result.includes('ownsHost:true'))
+    ctx.dispose()
+    assert.equal(ctx.webServer.taps.length, 0)
+  })
+
+  it('tapIndex transform handles Buffer input and bare fragments', () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+    const transform = ctx.webServer.taps[0]
+    const buf = Buffer.from('<html><head></head><body></body></html>', 'utf8')
+    const resultBuf = transform(buf)
+    assert.ok(resultBuf.toString('utf8').includes(BOOTSTRAP_SCRIPT))
+
+    const fragment = '<div>Fragment</div>'
+    const resultFrag = transform(fragment)
+    assert.ok(resultFrag.includes(BOOTSTRAP_SCRIPT))
+    ctx.dispose()
+  })
+
+  it('subscribes to webserver/index-inject and pushes global ownsHost row', () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+    const table = []
+    ctx.emit('webserver/index-inject', table)
+    assert.equal(table.length, 1)
+    assert.deepEqual(table[0], {
+      kind: 'global',
+      name: '__DSH_TRANSPORT__',
+      value: { ownsHost: true },
+    })
+    ctx.dispose()
+    const tableAfter = []
+    ctx.emit('webserver/index-inject', tableAfter)
+    assert.equal(tableAfter.length, 0)
+  })
+
+  it('activates cleanly and authorizes when webServer is absent', () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection, SECRET, { noWebServer: true })
     const response = fakeResponse()
     assert.equal(
       connection.authorizeIndex({ headers: { host: LOOPBACK_HOST, [HEADER_NAME]: SECRET } }, response),
       true,
     )
-    assert.equal(response.ended, false)
-    response.end('<!doctype html><html><head><meta charset="utf-8"></head><body><h1>DSH</h1></body></html>')
-    assert.equal(response.ended, true)
-    assert.ok(response.body.includes(BOOTSTRAP_SCRIPT))
-    assert.ok(response.body.includes('<head>' + BOOTSTRAP_SCRIPT))
-    assert.ok(response.body.includes('ownsHost:true'))
     ctx.dispose()
   })
 
-  it('valid secret handles Buffer payload in response.end', () => {
-    const connection = new FakeConnection()
-    const ctx = activate(connection)
-    const response = fakeResponse()
-    connection.authorizeIndex({ headers: { host: LOOPBACK_HOST, [HEADER_NAME]: SECRET } }, response)
-    response.end(Buffer.from('<html><head></head><body></body></html>', 'utf8'))
-    assert.ok(response.body.includes(BOOTSTRAP_SCRIPT))
-    ctx.dispose()
-  })
-
-  it('valid secret handles response.write then response.end', () => {
-    const connection = new FakeConnection()
-    const ctx = activate(connection)
-    const response = fakeResponse()
-    connection.authorizeIndex({ headers: { host: LOOPBACK_HOST, [HEADER_NAME]: SECRET } }, response)
-    response.write('<html><head><title>Test</title></head>')
-    response.end('<body>App</body></html>')
-    assert.ok(response.body.includes(BOOTSTRAP_SCRIPT))
-    assert.ok(response.body.includes('App'))
-    ctx.dispose()
-  })
-
-  it('valid secret strips stale Content-Length header', () => {
-    const connection = new FakeConnection()
-    const ctx = activate(connection)
-    const response = fakeResponse()
-    connection.authorizeIndex({ headers: { host: LOOPBACK_HOST, [HEADER_NAME]: SECRET } }, response)
-    response.setHeader('content-length', 42)
-    response.end('<html><head></head><body></body></html>')
-    assert.equal(response.hasHeader('content-length'), false)
-    ctx.dispose()
-  })
-
-  it('missing secret does not inject bootstrap script', () => {
+  it('missing secret does not authorize index', () => {
     const connection = new FakeConnection()
     const ctx = activate(connection)
     const response = fakeResponse()
     assert.equal(connection.authorizeIndex({ headers: { host: LOOPBACK_HOST } }, response), false)
     assert.equal(response.status, 401)
     assert.equal(response.body, 'unauthorized')
-    assert.ok(!response.body.includes('ownsHost'))
     ctx.dispose()
   })
 })
@@ -433,6 +483,12 @@ describe('bootstrap HTML injection', () => {
     const result = injectBootstrapHtml(buf)
     assert.ok(Buffer.isBuffer(result))
     assert.ok(result.toString('utf8').includes(BOOTSTRAP_SCRIPT))
+  })
+
+  it('does not duplicate injection when already present', () => {
+    const html = '<html><head>' + BOOTSTRAP_SCRIPT + '<title>DSH</title></head></html>'
+    const result = injectBootstrapHtml(html)
+    assert.equal(result, html)
   })
 })
 

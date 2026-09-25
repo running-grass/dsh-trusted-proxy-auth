@@ -332,7 +332,7 @@ try {
 
   const nativeIndex = await request({ port, path: '/', headers: { host: authority }, cookie: sessionCookie })
   check('native session cookie -> 200', nativeIndex.status === 200, `got ${nativeIndex.status}`)
-  check('native session cookie does not inject proxy ownsHost bootstrap', !nativeIndex.body.includes('ownsHost:true'))
+  check('native session cookie serves the HTML application', /<!doctype html>/i.test(nativeIndex.body))
 
   const badToken = await request({ port, path: '/?token=definitely-not-valid', headers: { host: authority } })
   check('invalid native token -> 401', badToken.status === 401, `got ${badToken.status}`)

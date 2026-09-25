@@ -14,20 +14,21 @@ They are recorded here as evidence; re-run the commands to reproduce.
 | DSH install files modified | none (`find … -newermt` returned no files) |
 | Production profile touched | no (the running server and its profile were left untouched) |
 
-## Unit tests — 60 passed, 0 failed
+## Unit tests — 62 passed, 0 failed
 
 ```console
 $ npm test
-ℹ tests 60
+ℹ tests 62
 ℹ suites 7
-ℹ pass 60
+ℹ pass 62
 ℹ fail 0
 ```
 
 Coverage: `requestRejection` result mapping (including pass-through of an
 unexpected upstream status); `authorizeIndex` decision tree; proxy bootstrap
-HTML injection (`__DSH_TRANSPORT__.ownsHost = true` script insertion in `<head>`,
-`</head>`, or fragment; Buffer and chunked handling; `Content-Length` removal);
+HTML injection (`__DSH_TRANSPORT__.ownsHost = true` script insertion via
+`webServer.tapIndex` and `webserver/index-inject` in `<head>`, `</head>`, or
+fragment; idempotency; Buffer handling; native response preservation);
 header parsing (exact, off-by-one, empty, missing, absent headers, array,
 non-string, duplicate, joined, `Headers` case-insensitivity); configuration
 failures (missing/empty/short/comma/whitespace/non-ASCII secret, missing
