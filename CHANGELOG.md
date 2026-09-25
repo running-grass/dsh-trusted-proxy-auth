@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-09-25
+
+### Fixed
+
+- Intercept `webServer.match` for runtime route normalisation:
+  - In DeepSeek Harness (`@deepseek-ai/dsh-host-webserver@0.1.5-rc.2`), `webServer.handle`
+    is a local closure inside `[Service.init]()` rather than an instance method on
+    the `WebServer` service. As a result, wrapping `webServer.handle` alone did not
+    intercept routes during live HTTP dispatch.
+  - Intercepted `webServer.match(pathname)` instead, which dynamically decorates
+    the matched route's `handler` at dispatch time with loopback normalisation
+    (`req.headers.host` -> `127.0.0.1:<port>` and `req.headers.origin` -> `http://127.0.0.1:<port>`).
+  - Preserves DSH's internal routing table (`exact` and `prefixes` maps) untouched,
+    ensuring clean disposal on plugin unload.
+  - Fixes HTTP 403 `untrusted origin` on `dshmarket` discovery and mutation endpoints
+    (`/dsh-market/discovery-compatibility`, `/dsh-market/update`, etc.) when accessed
+    through reverse proxies.
+  - Maintained `webServer.handle` wrapping as a backward-compatible fallback for
+    custom test harnesses and standalone web server implementations.
+  - Added unit test simulating the real-DSH `WebServer` dispatch pattern without a `handle` method (86 unit tests pass).
+
 ## [0.2.2] - 2026-09-25
 
 ### Added

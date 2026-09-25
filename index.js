@@ -502,17 +502,50 @@ export function apply(ctx) {
     }))
 
     // Decorate webServer if available:
-    // 1. webServer.handle: normalize proxy-authenticated requests to loopback for
-    // third-party plugin routes (e.g. dshmarket sameOrigin checks)
+    // 1. webServer.match & register: normalize proxy-authenticated requests to
+    // loopback for third-party plugin routes (e.g. dshmarket sameOrigin checks)
     const webServer = resolveWebServer(ctx)
     if (webServer) {
+      const wrapRoute = (route) => {
+        if (!route || typeof route.handler !== 'function') return route
+        if (route.handler[INNER]) return route
+        const originalHandler = route.handler
+        const wrappedHandler = async function (req, res) {
+          if (hasValidSecret(req)) {
+            const result = rejection.original.call(connection, req)
+            if (result !== undefined && result !== 401) {
+              writeForbidden(res)
+              return
+            }
+            normalizeToLoopback(req, webServer.port ?? 3080)
+          }
+          return originalHandler.call(this, req, res)
+        }
+        Object.defineProperty(wrappedHandler, INNER, {
+          value: { original: originalHandler, originalWasOwn: true },
+          enumerable: false,
+        })
+        Object.assign(wrappedHandler, originalHandler)
+        return { ...route, handler: wrappedHandler }
+      }
+
+      // 1. webServer.match: intercept route matching in DSH's internal handle loop
+      if (typeof webServer.match === 'function') {
+        const capturedMatch = captureMethod(webServer, 'match', 'webServer')
+        restores.push(installWrapper(webServer, capturedMatch, function match(pathname) {
+          const route = capturedMatch.original.call(webServer, pathname)
+          if (!route) return route
+          return wrapRoute(route)
+        }, 'webServer'))
+      }
+
+      // 2. webServer.handle: fallback for custom servers or test harnesses with a direct handle() method
       if (typeof webServer.handle === 'function') {
         const capturedHandle = captureMethod(webServer, 'handle', 'webServer')
         restores.push(installWrapper(webServer, capturedHandle, async function handle(request, response) {
           if (!hasValidSecret(request)) {
             return capturedHandle.original.call(webServer, request, response)
           }
-          // The proxy established identity; the Host/Origin fence still applies.
           const result = rejection.original.call(connection, request)
           if (result !== undefined && result !== 401) {
             writeForbidden(response)

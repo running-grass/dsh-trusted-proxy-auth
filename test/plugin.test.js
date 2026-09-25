@@ -47,10 +47,14 @@ function fakeContext(connection, options = {}) {
   const log = []
   const disposers = []
   const events = new Map()
+  const exactMap = new Map()
+  const prefixesMap = new Map()
   const webServer = options.webServer ?? {
     port: 3080,
     taps: [],
     routes: [],
+    exact: exactMap,
+    prefixes: prefixesMap,
     tapIndex(transform) {
       this.taps.push(transform)
       return () => {
@@ -60,19 +64,37 @@ function fakeContext(connection, options = {}) {
     },
     register(route) {
       this.routes.push(route)
+      const table = route.kind === 'prefix' || route.prefix ? this.prefixes : this.exact
+      const key = route.path ?? route.prefix
+      table.set(key, route)
       return () => {
         const idx = this.routes.indexOf(route)
         if (idx !== -1) this.routes.splice(idx, 1)
+        table.delete(key)
       }
+    },
+    match(pathname) {
+      const exact = this.exact.get(pathname)
+      if (exact !== undefined) return exact
+      for (const [prefix, route] of this.prefixes) {
+        if (pathname === prefix || pathname.startsWith(`${prefix}/`)) return route
+      }
+      return undefined
     },
     async handle(req, res) {
       const url = req.url ?? '/'
+      const pathname = new URL(url, 'http://x').pathname
+      const route = this.match(pathname)
+      if (route !== undefined) {
+        return await route.handler(req, res)
+      }
+      // Also fallback to iterating routes for custom test routes
       const method = (req.method ?? 'GET').toUpperCase()
-      for (const route of this.routes) {
-        const pathMatches = route.path ? route.path === url : (route.prefix ? url.startsWith(route.prefix) : false)
-        const methodMatches = !route.method || route.method.toUpperCase() === method
+      for (const r of this.routes) {
+        const pathMatches = r.path ? r.path === pathname || r.path === url : (r.prefix ? pathname.startsWith(r.prefix) || url.startsWith(r.prefix) : false)
+        const methodMatches = !r.method || r.method.toUpperCase() === method
         if (pathMatches && methodMatches) {
-          return await route.handler(req, res)
+          return await r.handler(req, res)
         }
       }
       res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }).end('not found')
@@ -1490,6 +1512,66 @@ describe('webServer third-party plugin route compatibility', () => {
     // Pristine original handle is restored
     assert.equal(Object.hasOwn(sharedWebServer, 'handle'), true)
     assert.equal(sharedWebServer.handle[INNER], undefined, 'wrapper marker removed')
+  })
+
+  it('dshmarket discovery route works on real-DSH WebServer structure without handle method', async () => {
+    const connection = new FakeConnection()
+    const realDshWebServer = {
+      port: 3080,
+      exact: new Map(),
+      prefixes: new Map(),
+      taps: [],
+      tapIndex(fn) { return () => {} },
+      register(route) {
+        const table = route.kind === 'prefix' ? this.prefixes : this.exact
+        table.set(route.path, route)
+        return () => table.delete(route.path)
+      },
+      match(pathname) {
+        const exact = this.exact.get(pathname)
+        if (exact !== undefined) return exact
+        for (const [prefix, route] of this.prefixes) {
+          if (pathname === prefix || pathname.startsWith(`${prefix}/`)) return route
+        }
+        return undefined
+      },
+      // Note: no handle() method on WebServer instance in real DSH!
+    }
+    const ctx = activate(connection, SECRET, { webServer: realDshWebServer })
+
+    realDshWebServer.register({
+      kind: 'exact',
+      path: '/dsh-market/discovery-compatibility',
+      async handler(req, res) {
+        if (!dshmarketSameOrigin(req)) {
+          res.writeHead(403, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'untrusted origin' }))
+          return
+        }
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ compatible: true }))
+      },
+    })
+
+    const req = {
+      method: 'POST',
+      url: '/dsh-market/discovery-compatibility',
+      headers: {
+        host: 'dsh.test.example',
+        origin: 'https://dsh.test.example',
+        [HEADER_NAME]: SECRET,
+      },
+    }
+    const res = fakeResponse()
+    // Simulate DSH's internal createServer handle loop:
+    const rawPath = new URL(req.url, 'http://x').pathname
+    const matched = realDshWebServer.match(rawPath)
+    assert.ok(matched !== undefined, 'route matched')
+    await matched.handler(req, res)
+
+    assert.equal(res.status, 200)
+    assert.deepEqual(JSON.parse(res.body), { compatible: true })
+    assert.equal(req.headers.host, '127.0.0.1:3080')
+    assert.equal(req.headers.origin, 'http://127.0.0.1:3080')
+    ctx.dispose()
   })
 })
 

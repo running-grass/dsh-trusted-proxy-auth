@@ -14,13 +14,13 @@ They are recorded here as evidence; re-run the commands to reproduce.
 | DSH install files modified | none (`find … -newermt` returned no files) |
 | Production profile touched | no (the running server and its profile were left untouched) |
 
-## Unit tests — 85 passed, 0 failed
+## Unit tests — 86 passed, 0 failed
 
 ```console
 $ npm test
-ℹ tests 85
+ℹ tests 86
 ℹ suites 9
-ℹ pass 85
+ℹ pass 86
 ℹ fail 0
 ```
 
@@ -31,11 +31,12 @@ HTML injection (`__DSH_TRANSPORT__.ownsHost = true` script insertion via
 fragment; idempotency; Buffer handling; native response preservation);
 `normalizeToLoopback` authority and origin rewriting (custom ports, port 80,
 plain objects, Fetch `Headers`, case insensitivity, idempotency);
-`webServer.handle` third-party plugin route compatibility (`dshmarket@1.65.1`
+`webServer.match` / `webServer.handle` third-party plugin route compatibility (`dshmarket@1.65.1`
 discovery and mutation routes with `sameOrigin` loopback checks; cross-origin
 CSRF attack rejection before normalization; cross-site fetch metadata rejection;
 untrusted Host rejection; unauthenticated request rejection; direct loopback
-passthrough; multiple plugins registering diverse routes; query parameter
+passthrough; real-DSH WebServer structure without handle method;
+multiple plugins registering diverse routes; query parameter
 handling; other HTTP methods; error bubbling; and lifecycle cleanup/restoration);
 header parsing (exact, off-by-one, empty, missing, absent headers, array,
 non-string, duplicate, joined, `Headers` case-insensitivity); configuration
