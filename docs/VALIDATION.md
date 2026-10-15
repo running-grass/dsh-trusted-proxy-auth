@@ -129,6 +129,41 @@ the trust fence (making an untrusted Host return `401`) cannot silently turn
 into a bypass. The real-DSH integration run above boots the server with this
 probe active, so the invariant is also proven against `0.1.5-rc.2` end to end.
 
+## Admission interface moved out of `requestRejection` (DSH 0.2.1-alpha.3)
+
+Recorded on 2026-10-15 against a live `0.2.1-alpha.3` checkout fronted by a
+reverse proxy that injects `X-DSH-Proxy-Auth`. Upstream moved the
+trust-and-credential decision into `connection.admit` and made
+`requestRejection` delegate to it; the `/api` prefix route and the Gateway
+WebSocket upgrade admit through `admit` and `admitConnection`, so neither ever
+reaches the `requestRejection` decoration.
+
+With the shared secret, on `0.2.3` and on `0.2.4`:
+
+| Request | `0.2.3` | `0.2.4` |
+| --- | --- | --- |
+| `GET /` | `200` | `200` |
+| `GET /api` | `401` | `404` (reaches the application) |
+| `GET /api`, no secret | `401` | `401` |
+| `GET /api`, wrong secret | `401` | `401` |
+| `GET /api`, valid secret, untrusted Host | `403` | `403` |
+| `Upgrade /api/remote.mux` | `401` | `101 Switching Protocols` |
+| `Upgrade /api/remote.mux`, no secret | `401` | `401` |
+
+`npm run test:integration` against that host, comparing the two releases:
+
+| Check | `0.2.3` | `0.2.4` |
+| --- | --- | --- |
+| `/api with valid proxy header reaches the application (not 401/403)` | FAIL (got 401) | ok |
+| `ws valid proxy header + trusted Host -> upgraded` | FAIL (got 401) | ok |
+| `ws valid proxy header + same Origin -> upgraded` | FAIL (got 401) | ok |
+| `valid proxy header injects ownsHost bootstrap into index HTML` | FAIL | ok (expectation updated, see below) |
+| totals | 27 passed, 5 failed | 31 passed, 1 failed |
+
+Both runs end in `FATAL: spawnSync … ETIMEDOUT` in the fail-closed phase, so the
+last two sections do not run either time; the remaining failure is unrelated to
+admission and is listed under known compatibility issues.
+
 ## Runtime interface probe (DSH 0.1.5-rc.2)
 
 Probe output against the real `HostConnectionService`:
@@ -179,3 +214,28 @@ changes either fails the profile loudly instead of silently removing
 authentication. CI runs the real-DSH integration suite on every push/PR against
 the pinned `0.1.5-rc.2`, and on a weekly schedule against
 `@deepseek-ai/dsh@latest` as an early-warning signal.
+
+### `0.2.1-alpha.3`
+
+One integration expectation still fails on `0.2.1-alpha.3`; it fails on `0.2.3`
+as well, so it was not introduced by this release.
+
+- `missing secret -> non-zero exit` and `short secret -> non-zero exit` — the
+  harness spawns the server and expects a failed plugin activation to abort the
+  boot. On `0.2.1-alpha.3` the process was still running when the 90 s
+  `spawnSync` timeout expired, so the run ends in `spawnSync … ETIMEDOUT` before
+  those checks. The mechanism was not confirmed: it reads as the boot keeping
+  the application running with the plugin absent, rather than a failed
+  activation terminating the process. That is still fail-closed for
+  authentication (no plugin means no secret promotion, so proxied requests
+  answer `401`), but it is no longer fail-closed for process startup, and the
+  harness expectation needs a decision. Re-check before relying on "a bad secret
+  makes the profile fail to boot" as an operational guarantee.
+
+Resolved in this release: `valid proxy header injects ownsHost bootstrap into
+index HTML` failed because `0.2.1-alpha.3` renders the structured
+`webserver/index-inject` row as JSON (`{"ownsHost":true}`), while the check
+matched the older tapIndex form (`{ownsHost:true}`). The bootstrap is delivered
+either way — a live index carried
+`<script>globalThis["__DSH_TRANSPORT__"] = {"ownsHost":true}</script>` — and the
+check now accepts both forms.

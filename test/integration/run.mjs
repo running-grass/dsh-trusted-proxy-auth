@@ -256,7 +256,10 @@ try {
   check('valid proxy header serves the HTML application', /<!doctype html>/i.test(validHeader.body))
   check(
     'valid proxy header injects ownsHost bootstrap into index HTML',
-    validHeader.body.includes('__DSH_TRANSPORT__') && validHeader.body.includes('ownsHost:true'),
+    // 0.2.1-alpha.3 renders the structured `webserver/index-inject` row as JSON
+    // (`{"ownsHost":true}`); the older tapIndex form was `{ownsHost:true}`.
+    validHeader.body.includes('__DSH_TRANSPORT__')
+      && (validHeader.body.includes('ownsHost:true') || validHeader.body.includes('"ownsHost":true')),
   )
 
   const evilHost = await request({ port, path: '/', headers: { host: EVIL_HOST, ...proxy } })

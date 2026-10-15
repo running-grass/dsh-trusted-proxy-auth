@@ -1,6 +1,6 @@
 {
   "name": "dsh-trusted-proxy-auth",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "DeepSeek Harness plugin that trusts authentication already performed by a reverse proxy (Traefik + Keycloak OIDC) while keeping native DSH browser authentication as a fallback.",
   "type": "module",
   "main": "./index.js",

@@ -385,6 +385,17 @@ function writeForbidden(response) {
 }
 
 /**
+ * Whether an admission result refuses the request (`{ rejection }`) rather than
+ * naming the Peer that speaks for it (`{ peer }`).
+ *
+ * @param result - value returned by `connection.admit` or `connection.admitConnection`.
+ * @returns true only when the result carries a rejection status.
+ */
+function isRejection(result) {
+  return result !== null && typeof result === 'object' && 'rejection' in result
+}
+
+/**
  * Emit one generic diagnostic line. Never called with request or secret data.
  *
  * @param ctx - owning Cordis context.
@@ -500,6 +511,44 @@ export function apply(ctx) {
       writeForbidden(response)
       return false
     }))
+
+    // DSH 0.2.1-alpha.3 moved the trust-and-credential decision out of
+    // `requestRejection` and into `admit`, which `requestRejection` now
+    // delegates to instead of the reverse. The `/api` prefix route and the
+    // Gateway WebSocket upgrade admit through `admit` and `admitConnection`, so
+    // they no longer observe the `requestRejection` decoration above: every
+    // proxy-authenticated request without a DSH cookie answered 401 while the
+    // index (decorated `authorizeIndex`) still served 200.
+    //
+    // Both are decorated where the installed DSH exposes them, so a host that
+    // admits only through `requestRejection` keeps its current behaviour.
+    // `admitConnection` is decorated as well because it may dispatch to
+    // `this.admit` on the undecorated instance. A 403 is never promoted.
+    if (typeof connection.admit === 'function') {
+      const admission = captureMethod(connection, 'admit')
+      restores.push(installWrapper(connection, admission, function admit(request) {
+        const result = admission.original.call(this, request)
+        if (!isRejection(result)) return result
+        if (result.rejection === 401 && hasValidSecret(request)) {
+          return { peer: connection.browserPeer }
+        }
+        return result
+      }))
+    }
+
+    if (typeof connection.admitConnection === 'function') {
+      const socketAdmission = captureMethod(connection, 'admitConnection')
+      restores.push(installWrapper(connection, socketAdmission, function admitConnection(request) {
+        const result = socketAdmission.original.call(this, request)
+        if (!isRejection(result)) return result
+        if (result.rejection === 401 && hasValidSecret(request)) {
+          // The shared browser Peer owns no socket, so there is nothing to
+          // release when this connection ends.
+          return { peer: connection.browserPeer, release: () => Promise.resolve() }
+        }
+        return result
+      }))
+    }
 
     // Decorate webServer if available:
     // 1. webServer.match & register: normalize proxy-authenticated requests to

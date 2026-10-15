@@ -4,6 +4,31 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-10-15
+
+### Fixed
+
+- Decorate `connection.admit` and `connection.admitConnection` for DeepSeek
+  Harness `0.2.1-alpha.3`, which moved the trust-and-credential decision out of
+  `requestRejection` into `admit` (`requestRejection` now delegates to `admit`
+  instead of the reverse):
+  - The `/api` prefix route and the Gateway WebSocket upgrade admit through
+    `admit` and `admitConnection`, so they no longer passed through the
+    `requestRejection` decoration. Every proxy-authenticated request without a
+    native DSH cookie answered `401` while the index (decorated
+    `authorizeIndex`) still served `200`, and `/api/remote.mux` never
+    upgraded.
+  - `admit` now promotes a `401` carrying the shared secret to the shared
+    browser Peer. `admitConnection` does the same and reports a no-op
+    `release`, because the shared browser Peer owns no socket. An upstream
+    `403` is still never promoted, so the Host/Origin fence keeps refusing
+    DNS-rebinding and cross-site requests.
+  - Both decorations are installed only where the installed DSH exposes the
+    method, so a host that admits solely through `requestRejection` keeps its
+    current behaviour.
+  - Added unit coverage for both entry points, the fence/secret matrix, the
+    no-op release, and the optional-method guards (97 unit tests pass).
+
 ## [0.2.3] - 2026-09-25
 
 ### Fixed

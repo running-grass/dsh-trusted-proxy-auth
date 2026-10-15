@@ -81,7 +81,7 @@ Install the plugin bundle into the Web profile and restart:
 dsh plugin --profile web add /path/to/dsh-trusted-proxy-auth
 
 # or directly from this repository, pinned to the released tag
-dsh plugin --profile web add git+https://github.com/lukepoo101/dsh-trusted-proxy-auth.git#v0.2.3
+dsh plugin --profile web add git+https://github.com/lukepoo101/dsh-trusted-proxy-auth.git#v0.2.4
 
 # an exact commit is equally acceptable for an authentication-boundary plugin
 dsh plugin --profile web add git+https://github.com/lukepoo101/dsh-trusted-proxy-auth.git#<40-char-commit>
@@ -140,6 +140,25 @@ guarantee unambiguous.
 | `401` (native browser auth) | valid | permitted |
 | `401` | missing/wrong | `401` |
 | `undefined` (native auth already passed) | any | permitted |
+
+`admit()` / `admitConnection()` (the `/api` route and the WebSocket mux on a
+DSH that admits through them):
+
+| Upstream result | Secret | Result |
+| --- | --- | --- |
+| `{ rejection: 403 }` | valid | unchanged `403` |
+| `{ rejection: 401 }` | valid | `{ peer: <shared browser Peer> }`; `admitConnection` adds a no-op `release` |
+| `{ rejection: 401 }` | missing/wrong | unchanged `401` |
+| `{ peer }` (native auth already passed) | any | unchanged |
+
+DSH `0.2.1-alpha.3` moved the trust-and-credential decision out of
+`requestRejection` into `admit`, and `requestRejection` now delegates to
+`admit` instead of the reverse. Because the `/api` route and the WebSocket
+upgrade admit through `admit` and `admitConnection`, both entry points are
+decorated as well; without that, those calls never reach the
+`requestRejection` decoration and every proxy-authenticated request answers
+`401`. Both decorations are installed only when the installed DSH exposes the
+method.
 
 `authorizeIndex()` (the frontend `/` route):
 
@@ -283,7 +302,11 @@ journalctl -u deepseek-harness -n 100
 
 If a future DSH renames or removes `requestRejection` / `authorizeIndex`, or
 changes their `403`/`401` semantics, the plugin refuses to activate and the
-profile fails to boot, rather than silently dropping authentication.
+profile fails to boot, rather than silently dropping authentication. `admit`
+and `admitConnection` cannot carry that probe, because they return a Peer rather
+than a status, so they are checked for presence only: a DSH that admits through
+a differently named method is not covered, and its API requests answer `401`
+again. Re-run the real-DSH integration suite after every DSH upgrade.
 
 **Uninstall.**
 
@@ -349,6 +372,9 @@ stable. The plugin therefore captures and restores methods through
 - `ctx.connection` is a proxy; `Object.isExtensible(ctx.connection)` is `true`.
 - `requestRejection`, `authorizeIndex`, and `authenticatedUrl` are inherited,
   writable, non-enumerable prototype methods (`own=false`).
+- `admit` and `admitConnection` are inherited prototype methods too on DSH
+  `0.2.1-alpha.3` and later. They are decorated when present, and skipped when a
+  host does not expose them.
 - Assignment through the proxy creates an own property on the raw instance;
   `delete` through the proxy removes it and exposes the prototype method again.
 

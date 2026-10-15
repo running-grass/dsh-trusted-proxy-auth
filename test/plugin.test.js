@@ -183,27 +183,54 @@ function readHeader(headers, name) {
   return typeof value === 'string' ? value : undefined
 }
 
+/** Whether an admission result refuses the request rather than naming a Peer. */
+function isRejection(result) {
+  return result !== null && typeof result === 'object' && 'rejection' in result
+}
+
 /**
  * Connection service whose methods live on the prototype, as upstream does.
  *
- * The default `requestRejection` mirrors DSH 0.1.5-rc.2: the Host/Origin fence
- * returns 403, and missing native browser authentication returns 401. Pass
- * `semantics` to simulate a future DSH that changed that mapping.
+ * The default `evaluate` mirrors DSH's trust-and-credential decision: the
+ * Host/Origin fence returns 403, and missing native browser authentication
+ * returns 401. Pass `semantics` to simulate a future DSH that changed that
+ * mapping.
+ *
+ * Admission follows DSH 0.2.1-alpha.3: `admit` owns the decision and
+ * `requestRejection` delegates to it, so a caller that admits through `admit`
+ * or `admitConnection` never reaches the `requestRejection` decoration. A host
+ * without those methods is covered by the plugin's optional decoration.
  */
 class FakeConnection {
   constructor(options = {}) {
     this.semantics = options.semantics
     this.rejectionCalls = 0
     this.indexCalls = 0
+    this.admitCalls = 0
+    this.connectionAdmitCalls = 0
+    this.browserPeer = { id: 'browser-peer' }
   }
 
   requestRejection(request) {
     this.rejectionCalls += 1
-    if (typeof this.semantics === 'function') return this.semantics(request)
-    return this.evaluate(request)
+    const admission = this.admit(request)
+    return isRejection(admission) ? admission.rejection : undefined
   }
 
-  /** DSH 0.1.5-rc.2 semantics, reusable by custom `semantics` overrides. */
+  admit(request) {
+    this.admitCalls += 1
+    const status = typeof this.semantics === 'function' ? this.semantics(request) : this.evaluate(request)
+    return status === undefined ? { peer: this.browserPeer } : { rejection: status }
+  }
+
+  admitConnection(request) {
+    this.connectionAdmitCalls += 1
+    const admission = this.admit(request)
+    if (isRejection(admission)) return admission
+    return { ...admission, release: () => Promise.resolve() }
+  }
+
+  /** DSH trust-and-credential semantics, reusable by custom `semantics` overrides. */
   evaluate(request) {
     const headers = request?.headers ?? {}
     const host = readHeader(headers, 'host')
@@ -253,6 +280,8 @@ function activate(connection, secret = SECRET, options = {}) {
   apply(ctx)
   connection.rejectionCalls = 0
   connection.indexCalls = 0
+  connection.admitCalls = 0
+  connection.connectionAdmitCalls = 0
   return ctx
 }
 
@@ -342,6 +371,130 @@ describe('requestRejection', () => {
       connection.requestRejection({ headers: { host: LOOPBACK_HOST, [HEADER_NAME]: SECRET } }),
       418,
     )
+    ctx.dispose()
+  })
+})
+
+describe('admit', () => {
+  const cases = [
+    {
+      title: 'untrusted Host (403) with a valid secret stays 403',
+      host: 'evil.example',
+      header: SECRET,
+      rejection: 403,
+    },
+    {
+      title: 'native 401 with a valid secret is admitted as the shared browser Peer',
+      header: SECRET,
+      peer: true,
+    },
+    {
+      title: 'native 401 with a missing header stays 401',
+      header: undefined,
+      rejection: 401,
+    },
+    {
+      title: 'native 401 with a wrong secret stays 401',
+      header: 'w'.repeat(48),
+      rejection: 401,
+    },
+    {
+      title: 'already authenticated (undefined) is left to upstream',
+      native: true,
+      header: undefined,
+      peer: true,
+    },
+    {
+      title: 'already authenticated (undefined) with a valid secret is still admitted',
+      native: true,
+      header: SECRET,
+      peer: true,
+    },
+  ]
+
+  for (const testCase of cases) {
+    it(testCase.title, () => {
+      const connection = new FakeConnection()
+      const ctx = activate(connection)
+      const headers = { host: testCase.host ?? LOOPBACK_HOST }
+      if (testCase.native === true) headers.cookie = NATIVE_SESSION
+      if (testCase.header !== undefined) headers[HEADER_NAME] = testCase.header
+      const result = connection.admit({ headers })
+      assert.equal(connection.admitCalls, 1, 'the upstream method runs exactly once')
+      if (testCase.peer === true) {
+        assert.equal(isRejection(result), false, 'the request is admitted')
+        assert.equal(result.peer, connection.browserPeer, 'the shared browser Peer speaks for it')
+      } else {
+        assert.equal(result.rejection, testCase.rejection)
+      }
+      ctx.dispose()
+    })
+  }
+
+  it('leaves a host without admit undecorated', () => {
+    const reference = new FakeConnection()
+    const connection = {
+      requestRejection: (request) => reference.evaluate(request),
+      authorizeIndex() {},
+    }
+    const ctx = activate(connection)
+    assert.equal(Object.hasOwn(connection, 'admit'), false)
+    assert.equal(Object.hasOwn(connection, 'requestRejection'), true, 'the other decorations stay')
+    ctx.dispose()
+  })
+})
+
+describe('admitConnection', () => {
+  it('admits a secret-bearing 401 with the shared browser Peer and a no-op release', async () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+    const result = connection.admitConnection({
+      headers: { host: LOOPBACK_HOST, [HEADER_NAME]: SECRET },
+    })
+    assert.equal(isRejection(result), false, 'the upgrade is admitted')
+    assert.equal(result.peer, connection.browserPeer)
+    assert.equal(connection.connectionAdmitCalls, 1, 'the upstream method runs exactly once')
+    assert.equal(typeof result.release, 'function')
+    // The shared browser Peer owns no socket, so releasing is idempotent.
+    await result.release()
+    await result.release()
+    ctx.dispose()
+  })
+
+  it('keeps an untrusted Host at 403 even with a valid secret', () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+    assert.deepEqual(
+      connection.admitConnection({ headers: { host: 'evil.example', [HEADER_NAME]: SECRET } }),
+      { rejection: 403 },
+    )
+    ctx.dispose()
+  })
+
+  it('keeps a 401 without the secret', () => {
+    const connection = new FakeConnection()
+    const ctx = activate(connection)
+    assert.deepEqual(
+      connection.admitConnection({ headers: { host: LOOPBACK_HOST } }),
+      { rejection: 401 },
+    )
+    ctx.dispose()
+  })
+
+  it('leaves a host without admitConnection undecorated', () => {
+    const reference = new FakeConnection()
+    const connection = {
+      requestRejection: (request) => reference.evaluate(request),
+      admit(request) {
+        const status = reference.evaluate(request)
+        return status === undefined ? { peer: connection.browserPeer } : { rejection: status }
+      },
+      authorizeIndex() {},
+      browserPeer: { id: 'browser-peer' },
+    }
+    const ctx = activate(connection)
+    assert.equal(Object.hasOwn(connection, 'admit'), true, 'the present method stays decorated')
+    assert.equal(Object.hasOwn(connection, 'admitConnection'), false)
     ctx.dispose()
   })
 })
@@ -741,9 +894,18 @@ describe('lifecycle', () => {
     activate(connection)
     assert.equal(Object.hasOwn(connection, 'requestRejection'), true)
     assert.equal(Object.hasOwn(connection, 'authorizeIndex'), true)
+    assert.equal(Object.hasOwn(connection, 'admit'), true)
+    assert.equal(Object.hasOwn(connection, 'admitConnection'), true)
     assert.notEqual(connection.requestRejection, FakeConnection.prototype.requestRejection)
+    assert.notEqual(connection.admit, FakeConnection.prototype.admit)
+    assert.notEqual(connection.admitConnection, FakeConnection.prototype.admitConnection)
     assert.equal(
       typeof FakeConnection.prototype.requestRejection,
+      'function',
+      'prototype method is never replaced',
+    )
+    assert.equal(
+      typeof FakeConnection.prototype.admit,
       'function',
       'prototype method is never replaced',
     )
@@ -755,8 +917,12 @@ describe('lifecycle', () => {
     ctx.dispose()
     assert.equal(Object.hasOwn(connection, 'requestRejection'), false)
     assert.equal(Object.hasOwn(connection, 'authorizeIndex'), false)
+    assert.equal(Object.hasOwn(connection, 'admit'), false)
+    assert.equal(Object.hasOwn(connection, 'admitConnection'), false)
     assert.equal(connection.requestRejection, FakeConnection.prototype.requestRejection)
     assert.equal(connection.authorizeIndex, FakeConnection.prototype.authorizeIndex)
+    assert.equal(connection.admit, FakeConnection.prototype.admit)
+    assert.equal(connection.admitConnection, FakeConnection.prototype.admitConnection)
     assert.equal(
       connection.requestRejection({ headers: { host: LOOPBACK_HOST, [HEADER_NAME]: SECRET } }),
       401,
